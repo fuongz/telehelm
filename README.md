@@ -4,7 +4,7 @@
 
 Written in **TypeScript**, run on the **[Bun](https://bun.sh)** runtime (no build step — Bun executes the `.ts` entry directly).
 
-Control your homelab's Docker containers from Telegram — list, view logs/stats, and start/stop/restart — with a security model designed around the fact that **a Telegram bot is an internet-reachable remote-control surface**.
+Control your homelab's Docker containers from Telegram — list, view logs/stats, start/stop/restart, and **watch logs for patterns that ping you when they appear** — with a security model designed around the fact that **a Telegram bot is an internet-reachable remote-control surface**.
 
 ## Flow
 
@@ -41,7 +41,7 @@ Layered on top:
 - **Confirmation step.** Start/stop/restart require a second tap (`✅ Yes`).
 - **Rate limiting.** Per-user sliding window, on top of the allowlist.
 - **Audit log.** Every privileged action emits a JSON line (`audit: true`) with user ID, action, target, and result — captured by the Docker log driver.
-- **Hardened bot container.** Runs as non-root, `cap_drop: ALL`, `no-new-privileges`, read-only root filesystem.
+- **Hardened bot container.** Runs as non-root, `cap_drop: ALL`, `no-new-privileges`, read-only root filesystem. The only writable path is a dedicated `monitors` named volume at `/data` (owned by the unprivileged `bun` uid), where log-monitor definitions persist — nothing else on disk is mutable.
 
 ## Setup
 
@@ -68,13 +68,35 @@ bun run dev        # watch mode; or `bun start`
 bun run typecheck  # tsc --noEmit
 ```
 
-Point the bot at your proxy with `DOCKER_PROXY_HOST` / `DOCKER_PROXY_PORT` (defaults: `socket-proxy:2375`).
+Point the bot at your proxy with `DOCKER_PROXY_HOST` / `DOCKER_PROXY_PORT` (defaults: `socket-proxy:2375`). The default monitors path (`/data/monitors.json`) won't be writable outside Docker — set `MONITORS_FILE` to a local path (e.g. `./monitors.json`) if you want monitors to persist during local dev.
 
 ## Usage
 
 - `/ps` — list all containers; tap one to open its menu.
-- Container menu: **📄 Logs** (last 100 lines), **📊 Stats** (CPU/mem, sampled over 1s for accuracy), and **▶️ Start / ⏹️ Stop / 🔄 Restart** (with confirmation).
+- Container menu: **📄 Logs** (last 100 lines), **📊 Stats** (CPU/mem, sampled over 1s for accuracy), **🔔 Monitor** (regex log watches — see below), and **▶️ Start / ⏹️ Stop / 🔄 Restart** (with confirmation).
+- `/watches` — list every active log monitor across all containers.
 - `/help` — command summary.
+
+### Log monitors
+
+A log monitor watches one container's output for lines matching a regex and pings you on Telegram when new matches appear. Each monitor polls on its own interval and only ever inspects logs emitted **since its last check**, so a steady pre-existing line never re-fires — you're alerted only on genuinely fresh matches.
+
+Set one up entirely from Telegram:
+
+1. `/ps` → tap a container → **🔔 Monitor** → **➕ Add monitor**.
+2. Reply with the interval (seconds) followed by the regex, e.g.:
+   ```
+   30 ERROR|panic|fatal
+   ```
+3. Manage existing monitors from the same view: **⏸️ Pause / ▶️ Resume** and **🗑️ Delete**.
+
+Details:
+
+- Matching is **case-sensitive** (the pattern is compiled as `new RegExp(pattern)` with no flags) and tested per log line.
+- The interval is bounded by `MONITOR_MIN_INTERVAL` (default `5`s, protects the Docker socket from aggressive polling) and `MONITOR_MAX_INTERVAL` (default `86400`s).
+- Notifications cap at the first 10 matching lines per check to stay within Telegram's message limits.
+- A monitor that fails its check 5 times in a row (e.g. the container was removed) auto-disables and tells you why.
+- Definitions persist to `/data/monitors.json` on the `monitors` volume, so they survive bot restarts and updates. If that path can't be written the bot falls back to in-memory monitors and logs `monitor_persist_disabled`.
 
 ## What the bot can and cannot do
 
@@ -82,6 +104,7 @@ Point the bot at your proxy with `DOCKER_PROXY_HOST` / `DOCKER_PROXY_PORT` (defa
 |---|---|
 | List / inspect containers | ✅ |
 | View logs, stats | ✅ |
+| Watch logs for a regex, get alerts | ✅ |
 | Start / stop / restart | ✅ |
 | Create / run new containers | ❌ blocked at proxy |
 | `exec` into a container | ❌ blocked at proxy |
