@@ -84,18 +84,33 @@ A log monitor watches one container's output for lines matching a regex and ping
 Set one up entirely from Telegram:
 
 1. `/ps` → tap a container → **🔔 Monitor** → **➕ Add monitor**.
-2. Reply with the interval (seconds) followed by the regex, e.g.:
+2. Reply with the interval (seconds) followed by the regex. Optional extra lines tune it:
    ```
    30 ERROR|panic|fatal
+   ignore: healthcheck|debug
+   cooldown: 600
+   min: 5
+   multiline: ^\d{4}-\d{2}-\d{2}
    ```
-3. Manage existing monitors from the same view: **⏸️ Pause / ▶️ Resume** and **🗑️ Delete**.
+   - `ignore:` — a second regex; lines matching it are skipped (silence known-noisy output).
+   - `cooldown:` — minimum seconds between alerts for this monitor (defaults to `MONITOR_DEFAULT_COOLDOWN`).
+   - `min:` — only alert if at least N matches occur in a single check; the check interval is the effective window, so a lone transient line stays quiet while a burst fires.
+   - `multiline:` — a "firstline" regex marking the start of a log block. Lines that don't match it are folded into the preceding block, so a stack trace becomes **one** alert instead of one per line. The match/ignore regexes then test the whole block.
+3. The bot shows a **dry-run preview** — what the pattern would have matched in the recent log tail — then a **✅ Create / ❌ Cancel** choice before anything is saved.
+4. Manage existing monitors from the same view: **⏸️ Pause / ▶️ Resume** and **🗑️ Delete**.
 
 Details:
 
 - Matching is **case-sensitive** (the pattern is compiled as `new RegExp(pattern)` with no flags) and tested per log line.
 - The interval is bounded by `MONITOR_MIN_INTERVAL` (default `5`s, protects the Docker socket from aggressive polling) and `MONITOR_MAX_INTERVAL` (default `86400`s).
+- **Cooldown / anti-storm.** After an alert fires, further matches are counted but not sent until the cooldown elapses; the next alert notes how many were suppressed. This stops a fast-flapping line from flooding the chat.
+- **Threshold debounce (`min:`).** Require N matches within a single check before alerting, so a one-off transient is ignored and only a real burst pages you.
+- **Multi-line matching (`multiline:`).** Group stack traces and other multi-line records into a single alert via a firstline regex, instead of one alert per line.
+- **Restart catch-up.** The last-checked timestamp is persisted, so on startup each monitor immediately scans the gap since the bot was last up — you don't miss (or wait a full interval for) matches that occurred during downtime.
 - Notifications cap at the first 10 matching lines per check to stay within Telegram's message limits.
 - A monitor that fails its check 5 times in a row (e.g. the container was removed) auto-disables and tells you why.
+- **Bounded by design.** A check won't start while the previous one is still running (no stacking on a slow Docker call); the total monitor count is capped (`MONITOR_MAX`); each log line/block is length-capped (`MONITOR_MAX_MATCH_LEN`) before matching and obviously catastrophic patterns (e.g. `(a+)+`) are rejected at add time, to bound regex backtracking.
+- **Audited.** Creating, pausing/resuming, deleting, and auto-disabling a monitor each emit an `audit` log line with the acting user.
 - Definitions persist to `/data/monitors.json` on the `monitors` volume, so they survive bot restarts and updates. If that path can't be written the bot falls back to in-memory monitors and logs `monitor_persist_disabled`.
 
 ## What the bot can and cannot do

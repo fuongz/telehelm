@@ -137,14 +137,47 @@ async function statsView(ctx: Context, id: string): Promise<void> {
 // ---- Log monitors ----------------------------------------------------------
 
 // Pending "send me the pattern" prompts, keyed by user id. The next plain-text
-// message from that user is consumed as the monitor spec. Entries self-expire
-// so a forgotten prompt can't capture an unrelated message hours later.
+// message from that user is consumed as the monitor spec; once parsed it's held
+// here so the "✅ Create" button can finalize it. Entries self-expire so a
+// forgotten prompt can't capture an unrelated message hours later.
 const PROMPT_TTL_MS = 5 * 60 * 1000;
-const awaiting = new Map<string, { containerId: string; expires: number }>();
+const awaiting = new Map<
+	string,
+	{ containerId: string; expires: number; spec?: mon.SpecInput }
+>();
 
 function fmtMonitor(m: mon.Monitor): string {
 	const dot = m.enabled ? "🟢" : "⚪";
-	return `${dot} \`/${m.pattern}/\` every ${m.intervalSec}s`;
+	const min = m.minMatches > 1 ? ` · ≥${m.minMatches}/check` : "";
+	const ml = m.multiline ? " · multiline" : "";
+	const ign = m.ignore ? ` · ignore \`/${m.ignore}/\`` : "";
+	return `${dot} \`/${m.pattern}/\` every ${m.intervalSec}s · cooldown ${m.cooldownSec}s${min}${ml}${ign}`;
+}
+
+// Parse a monitor spec from the user's reply. Line 1 is `<interval> <regex>`;
+// optional follow-up lines tune it: `ignore: <regex>`, `cooldown: <seconds>`,
+// `multiline: <firstline-regex>`, `min: <count>`. The match regex is taken
+// verbatim (it may contain spaces), so it must be on line 1.
+function parseSpec(text: string): mon.SpecInput {
+	const lines = text.split("\n");
+	const first = (lines[0] || "").trim();
+	const sp = first.indexOf(" ");
+	const intervalSec = parseInt(sp === -1 ? first : first.slice(0, sp), 10);
+	const pattern = sp === -1 ? "" : first.slice(sp + 1).trim();
+
+	const spec: mon.SpecInput = { pattern, intervalSec };
+	for (const raw of lines.slice(1)) {
+		const ln = raw.trim();
+		const ig = /^ignore:\s*(.+)$/i.exec(ln)?.[1];
+		if (ig) spec.ignore = ig.trim();
+		const ml = /^multiline:\s*(.+)$/i.exec(ln)?.[1];
+		if (ml) spec.multiline = ml.trim();
+		const cd = /^cooldown:\s*(\d+)\s*$/i.exec(ln)?.[1];
+		if (cd) spec.cooldownSec = parseInt(cd, 10);
+		const mn = /^min:\s*(\d+)\s*$/i.exec(ln)?.[1];
+		if (mn) spec.minMatches = parseInt(mn, 10);
+	}
+	return spec;
 }
 
 async function monitorView(ctx: Context, id: string): Promise<void> {
@@ -183,6 +216,12 @@ async function monitorAddPrompt(ctx: Context, id: string): Promise<void> {
 		`*Add monitor — ${c.name}*\n` +
 		"Reply with the interval (seconds) then the regex, e.g.\n" +
 		"`30 ERROR|panic|fatal`\n\n" +
+		"Optional extra lines:\n" +
+		"`ignore: healthcheck|debug` — skip noisy lines\n" +
+		"`cooldown: 600` — min seconds between alerts\n" +
+		"`min: 5` — only alert if ≥N matches in one check\n" +
+		"`multiline: ^\\d{4}-\\d{2}-\\d{2}` — group stack traces into one alert\n\n" +
+		"I'll show a preview of recent matches before creating it.\n" +
 		"Send /cancel to abort.";
 	const kb = Markup.inlineKeyboard([
 		[Markup.button.callback("❌ Cancel", `a:mon:${id}`)],
@@ -190,7 +229,9 @@ async function monitorAddPrompt(ctx: Context, id: string): Promise<void> {
 	return render(ctx, text, kb);
 }
 
-// Consume the user's reply to an add prompt. Returns true if it was handled.
+// Consume the user's reply to an add prompt: parse + validate, then dry-run the
+// pattern against recent logs and show a preview with a Create/Cancel choice.
+// Returns true if it was handled (i.e. an add was pending for this user).
 async function handleMonitorReply(
 	ctx: Context,
 	text: string,
@@ -212,35 +253,86 @@ async function handleMonitorReply(
 		return true;
 	}
 
-	// First token = interval, the rest (verbatim) = regex.
-	const trimmed = text.trim();
-	const sp = trimmed.indexOf(" ");
-	const intervalSec = parseInt(sp === -1 ? trimmed : trimmed.slice(0, sp), 10);
-	const pattern = sp === -1 ? "" : trimmed.slice(sp + 1).trim();
-
-	const chat = ctx.chat;
+	const spec = parseSpec(text);
 	try {
-		mon.validate(pattern, intervalSec);
-		const info = await d.inspect(pending.containerId);
-		const m = mon.addMonitor({
-			containerId: pending.containerId,
-			containerName: info.name,
-			pattern,
-			intervalSec,
-			chatId: chat ? chat.id : from.id,
-			createdBy: userId,
-		});
-		awaiting.delete(userId);
-		await ctx.reply(
-			`✅ Monitoring *${info.name}* for \`/${m.pattern}/\` every ${m.intervalSec}s.`,
-			{ parse_mode: "Markdown" },
-		);
+		mon.validate(spec);
 	} catch (e) {
 		// Keep the prompt open so the user can correct and resend.
 		const msg = e instanceof Error ? e.message : String(e);
 		await ctx.reply(`⚠️ ${msg}\nTry again, or /cancel.`);
+		return true;
 	}
+
+	// Stash the validated spec so the Create button can finalize it, then show
+	// what it would have matched in the recent log tail (dry run).
+	pending.spec = spec;
+	pending.expires = Date.now() + PROMPT_TTL_MS;
+	const info = await d.inspect(pending.containerId);
+	const unit = spec.multiline ? "block(s)" : "line(s)";
+	let previewBlock: string;
+	try {
+		const { sampled, matched } = await mon.preview(pending.containerId, spec);
+		if (matched.length === 0) {
+			previewBlock = `No matches in the last ${sampled} log ${unit} — it'll still watch *new* logs.`;
+		} else {
+			const shown = matched.slice(-8).join("\n").slice(-1500);
+			previewBlock =
+				`Would match *${matched.length}* of the last ${sampled} ${unit}:\n` +
+				`\`\`\`\n${shown}\n\`\`\``;
+		}
+	} catch (e) {
+		const msg = e instanceof Error ? e.message : String(e);
+		previewBlock = `_(Couldn't fetch logs to preview: ${msg})_`;
+	}
+
+	const head =
+		`*Preview — ${info.name}*\n` +
+		`Pattern: \`${spec.pattern}\`\n` +
+		(spec.ignore ? `Ignore: \`${spec.ignore}\`\n` : "") +
+		(spec.multiline ? `Multiline: \`${spec.multiline}\`\n` : "") +
+		`Every ${spec.intervalSec}s` +
+		(spec.cooldownSec !== undefined ? `, cooldown ${spec.cooldownSec}s` : "") +
+		(spec.minMatches !== undefined ? `, ≥${spec.minMatches}/check` : "") +
+		"\n\n";
+	const kb = Markup.inlineKeyboard([
+		[
+			Markup.button.callback("✅ Create", `mon:ok:${pending.containerId}`),
+			Markup.button.callback("❌ Cancel", `a:mon:${pending.containerId}`),
+		],
+	]);
+	await ctx.reply(head + previewBlock, { parse_mode: "Markdown", ...kb });
 	return true;
+}
+
+// Finalize a previewed monitor when the user taps ✅ Create.
+async function monitorCreate(ctx: Context, containerId: string): Promise<void> {
+	const from = ctx.from;
+	if (!from) return;
+	const userId = String(from.id);
+	const pending = awaiting.get(userId);
+	if (!pending?.spec || pending.containerId !== containerId) {
+		await ctx.answerCbQuery("Expired — start again").catch(() => {});
+		return monitorView(ctx, containerId);
+	}
+	const spec = pending.spec;
+	const chat = ctx.chat;
+	try {
+		const info = await d.inspect(containerId);
+		mon.addMonitor({
+			...spec,
+			containerId,
+			containerName: info.name,
+			chatId: chat ? chat.id : from.id,
+			createdBy: userId,
+		});
+		awaiting.delete(userId);
+		await ctx.answerCbQuery("Created ✓").catch(() => {});
+		return monitorView(ctx, containerId);
+	} catch (e) {
+		const msg = e instanceof Error ? e.message : String(e);
+		await ctx.answerCbQuery("Failed").catch(() => {});
+		await ctx.reply(`⚠️ ${msg}`).catch(() => {});
+	}
 }
 
 // Flat list of every monitor across all containers, for /watches.
@@ -365,15 +457,19 @@ export function register(bot: Telegraf<Context>): void {
 					await ctx.answerCbQuery().catch(() => {});
 					return monitorAddPrompt(ctx, b);
 				}
+				if (a === "ok") {
+					return monitorCreate(ctx, b);
+				}
+				const actor = ctx.from ? String(ctx.from.id) : undefined;
 				if (a === "tog") {
-					const m = mon.toggleMonitor(b);
+					const m = mon.toggleMonitor(b, actor);
 					await ctx
 						.answerCbQuery(m?.enabled ? "Resumed" : "Paused")
 						.catch(() => {});
 					if (m) return monitorView(ctx, m.containerId);
 				}
 				if (a === "del") {
-					const m = mon.removeMonitor(b);
+					const m = mon.removeMonitor(b, actor);
 					await ctx.answerCbQuery(m ? "Deleted" : "Gone").catch(() => {});
 					if (m) return monitorView(ctx, m.containerId);
 				}
