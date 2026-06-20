@@ -41,9 +41,12 @@ services:
       - SERVICES=0
       - TASKS=0
     volumes:
+      # Host socket path. Defaults to the standard Linux location; override via
+      # DOCKER_SOCK in .env when the daemon lives elsewhere (e.g. OrbStack:
+      # /Users/<you>/.orbstack/run/docker.sock, or rootless: $XDG_RUNTIME_DIR).
       # :ro stops replacement of the socket file. It does NOT make the API
       # read-only — that is governed entirely by the flags above.
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock:ro
     networks:
       - internal          # NO egress network -> proxy cannot reach the internet
     security_opt:
