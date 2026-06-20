@@ -25,7 +25,7 @@ What you expected to happen instead.
 
 ## Logs
 
-Relevant lines from `docker logs dtb-bot` / `docker logs dtb-socket-proxy`.
+Relevant lines from `docker logs telehelm-bot` / `docker logs telehelm-socket-proxy`.
 **Redact tokens and user IDs first.**
 
 ```

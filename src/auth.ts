@@ -1,13 +1,12 @@
-'use strict';
-
-const log = require('./logger');
+import type { Context, MiddlewareFn } from 'telegraf';
+import log from './logger';
 
 // ---- User allowlist -------------------------------------------------------
 // The bot token is internet-reachable via Telegram's relay, so the numeric
 // user-ID allowlist is the primary access gate. Anything not on it is dropped
 // silently (no reply) to avoid confirming the bot exists to strangers.
 
-const ALLOWED = new Set(
+export const ALLOWED = new Set<string>(
   (process.env.ALLOWED_USER_IDS || '')
     .split(',')
     .map((s) => s.trim())
@@ -27,9 +26,9 @@ if (ALLOWED.size === 0) {
 
 const MAX = parseInt(process.env.RATE_LIMIT_MAX || '20', 10);
 const WINDOW = parseInt(process.env.RATE_LIMIT_WINDOW_MS || '60000', 10);
-const hits = new Map(); // userId -> number[] (timestamps)
+const hits = new Map<string, number[]>(); // userId -> timestamps
 
-function rateLimited(userId) {
+function rateLimited(userId: string): boolean {
   const now = Date.now();
   const arr = (hits.get(userId) || []).filter((t) => now - t < WINDOW);
   arr.push(now);
@@ -47,7 +46,7 @@ setInterval(() => {
   }
 }, WINDOW).unref();
 
-function authMiddleware() {
+export function authMiddleware(): MiddlewareFn<Context> {
   return async (ctx, next) => {
     const from = ctx.from;
     if (!from) return; // service updates with no user
@@ -61,7 +60,7 @@ function authMiddleware() {
 
     if (rateLimited(userId)) {
       log.warn('rate_limited', { userId, username: from.username });
-      if (ctx.answerCbQuery) await ctx.answerCbQuery('Slow down ⏳').catch(() => {});
+      if (ctx.callbackQuery) await ctx.answerCbQuery('Slow down ⏳').catch(() => {});
       else await ctx.reply('Slow down — too many requests. Try again shortly.').catch(() => {});
       return;
     }
@@ -69,5 +68,3 @@ function authMiddleware() {
     return next();
   };
 }
-
-module.exports = { authMiddleware, ALLOWED };

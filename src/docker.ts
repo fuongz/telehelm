@@ -1,6 +1,4 @@
-'use strict';
-
-const Docker = require('dockerode');
+import Docker from 'dockerode';
 
 // This is the ONLY module that talks to Docker. It points at the socket-proxy
 // over the internal network — never at /var/run/docker.sock directly. The proxy
@@ -12,22 +10,52 @@ const docker = new Docker({
   protocol: 'http',
 });
 
-const SHORT = (id) => (id || '').slice(0, 12);
+export const SHORT = (id: string | undefined): string => (id || '').slice(0, 12);
+
+export interface ContainerSummary {
+  id: string;
+  name: string;
+  image: string;
+  state: string; // running | exited | paused | ...
+  status: string; // human string e.g. "Up 3 hours"
+}
+
+export interface ContainerDetail {
+  id: string;
+  name: string;
+  state: string;
+  tty: boolean;
+  image: string;
+}
+
+export interface LogsResult {
+  name: string;
+  text: string;
+}
+
+export interface StatsResult {
+  name: string;
+  running: boolean;
+  cpuPct?: number;
+  memUsed?: number;
+  memLimit?: number;
+  memPct?: number;
+}
 
 // ---- Read operations (need CONTAINERS=1 on the proxy) ---------------------
 
-async function listContainers() {
+export async function listContainers(): Promise<ContainerSummary[]> {
   const raw = await docker.listContainers({ all: true });
   return raw.map((c) => ({
     id: SHORT(c.Id),
     name: (c.Names && c.Names[0] ? c.Names[0] : c.Id).replace(/^\//, ''),
     image: c.Image,
-    state: c.State, // running | exited | paused | ...
-    status: c.Status, // human string e.g. "Up 3 hours"
+    state: c.State,
+    status: c.Status,
   }));
 }
 
-async function inspect(id) {
+export async function inspect(id: string): Promise<ContainerDetail> {
   const data = await docker.getContainer(id).inspect();
   return {
     id: SHORT(data.Id),
@@ -41,7 +69,7 @@ async function inspect(id) {
 // Docker multiplexes stdout/stderr into frames of [type][000][size BE][payload]
 // unless the container was started with a TTY. Strip the frame headers so the
 // user sees clean text.
-function demux(buffer, tty) {
+function demux(buffer: Buffer, tty: boolean): string {
   if (tty) return buffer.toString('utf8');
   let out = '';
   let off = 0;
@@ -50,13 +78,13 @@ function demux(buffer, tty) {
     const start = off + 8;
     const end = start + size;
     if (end > buffer.length) break;
-    out += buffer.slice(start, end).toString('utf8');
+    out += buffer.subarray(start, end).toString('utf8');
     off = end;
   }
   return out || buffer.toString('utf8');
 }
 
-async function logs(id, tail = 100) {
+export async function logs(id: string, tail = 100): Promise<LogsResult> {
   const meta = await inspect(id);
   const buf = await docker.getContainer(id).logs({
     stdout: true,
@@ -66,14 +94,14 @@ async function logs(id, tail = 100) {
     follow: false,
   });
   // dockerode returns a Buffer when follow:false
-  let text = demux(Buffer.isBuffer(buf) ? buf : Buffer.from(buf), meta.tty);
+  let text = demux(Buffer.isBuffer(buf) ? buf : Buffer.from(buf as unknown as ArrayBuffer), meta.tty);
   // Strip ANSI escape codes for clean display in Telegram.
   text = text.replace(/\x1B\[[0-9;]*[A-Za-z]/g, '');
   return { name: meta.name, text };
 }
 
 // One-shot stats give a bad CPU% (precpu is empty), so sample twice ~1s apart.
-async function stats(id) {
+export async function stats(id: string): Promise<StatsResult> {
   const meta = await inspect(id);
   if (meta.state !== 'running') {
     return { name: meta.name, running: false };
@@ -95,30 +123,21 @@ async function stats(id) {
   const memLimit = s2.memory_stats.limit || 0;
   const memPct = memLimit > 0 ? (memUsed / memLimit) * 100 : 0;
 
-  return {
-    name: meta.name,
-    running: true,
-    cpuPct,
-    memUsed,
-    memLimit,
-    memPct,
-  };
+  return { name: meta.name, running: true, cpuPct, memUsed, memLimit, memPct };
 }
 
 // ---- Lifecycle operations (gated by ALLOW_START/STOP/RESTARTS on the proxy) --
 
-async function start(id) {
+export async function start(id: string): Promise<void> {
   await docker.getContainer(id).start();
 }
-async function stop(id) {
+export async function stop(id: string): Promise<void> {
   await docker.getContainer(id).stop();
 }
-async function restart(id) {
+export async function restart(id: string): Promise<void> {
   await docker.getContainer(id).restart();
 }
 
-async function ping() {
+export async function ping(): Promise<void> {
   await docker.ping();
 }
-
-module.exports = { listContainers, inspect, logs, stats, start, stop, restart, ping, SHORT };

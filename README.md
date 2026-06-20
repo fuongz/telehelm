@@ -2,6 +2,8 @@
 
 > Steer your Docker containers from Telegram — your phone is the helm.
 
+Written in **TypeScript**, run on the **[Bun](https://bun.sh)** runtime (no build step — Bun executes the `.ts` entry directly).
+
 Control your homelab's Docker containers from Telegram — list, view logs/stats, and start/stop/restart — with a security model designed around the fact that **a Telegram bot is an internet-reachable remote-control surface**.
 
 ## Flow
@@ -50,11 +52,23 @@ Layered on top:
    cp .env.example .env
    # edit .env: set BOT_TOKEN and ALLOWED_USER_IDS (comma-separated)
    ```
-4. **Run** (on the homelab):
+4. **Run** (on the homelab). Compose reads secrets from the `.env` file you just created:
    ```bash
    docker compose up -d --build
    ```
 5. In Telegram, open your bot and send `/ps`.
+
+### Local development (without Docker)
+
+You need [Bun](https://bun.sh) ≥ 1.1 and a reachable socket proxy.
+
+```bash
+bun install
+bun run dev        # watch mode; or `bun start`
+bun run typecheck  # tsc --noEmit
+```
+
+Point the bot at your proxy with `DOCKER_PROXY_HOST` / `DOCKER_PROXY_PORT` (defaults: `socket-proxy:2375`).
 
 ## Usage
 
@@ -75,8 +89,8 @@ Layered on top:
 
 ## Troubleshooting
 
-- **`docker_proxy_unreachable` in logs** — the proxy didn't start, or the socket isn't mounted. Check `docker logs dtb-socket-proxy`.
-- **Bot doesn't respond at all** — your user ID isn't in `ALLOWED_USER_IDS` (unauthorized messages are dropped silently; check `docker logs dtb-bot` for `unauthorized` lines), or `BOT_TOKEN` is wrong.
+- **`docker_proxy_unreachable` in logs** — the proxy didn't start, or the socket isn't mounted. Check `docker logs telehelm-socket-proxy`.
+- **Bot doesn't respond at all** — your user ID isn't in `ALLOWED_USER_IDS` (unauthorized messages are dropped silently; check `docker logs telehelm-bot` for `unauthorized` lines), or `BOT_TOKEN` is wrong.
 - **`409 Conflict` on launch** — another instance is already polling the same token. Run only one.
 - **Logs look garbled** — handled for non-TTY containers via frame de-multiplexing and ANSI stripping; open an issue if a specific container still misbehaves.
 

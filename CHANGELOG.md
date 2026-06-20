@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Rewrote the source in **TypeScript**, now run on the **Bun** runtime (no
+  build step — Bun executes the `.ts` entry directly).
+- Dockerfile rebuilt on `oven/bun:1-alpine` (multi-stage, non-root `bun` user).
+- `docker-compose.yml`: named stack (`telehelm`), containers renamed to
+  `telehelm-bot` / `telehelm-socket-proxy`, secrets loaded from an optional
+  `.env` file via `env_file`.
+
 ## [1.0.0]
 
 ### Added

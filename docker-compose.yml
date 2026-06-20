@@ -1,3 +1,7 @@
+# Stack / project name (shown in `docker compose ls`, Portainer, and used as
+# the default network/volume prefix).
+name: telehelm
+
 services:
   # --- Socket proxy: the only thing that touches the real Docker socket ------
   # LinuxServer.io fork is used because its ALLOW_START / ALLOW_STOP /
@@ -5,7 +9,7 @@ services:
   # POST=1 (which would also unlock container create, exec, etc.).
   socket-proxy:
     image: lscr.io/linuxserver/socket-proxy:latest
-    container_name: dtb-socket-proxy
+    container_name: telehelm-socket-proxy
     restart: unless-stopped
     environment:
       # Read access (covers ps / inspect / logs / stats):
@@ -43,21 +47,24 @@ services:
       - no-new-privileges:true
 
   # --- Bot: reaches Telegram outbound, reaches Docker only via the proxy -----
-  # Secrets come from the environment (e.g. Portainer stack env vars), NOT from
-  # this file — so the repo stays safe to push. Define BOT_TOKEN and
-  # ALLOWED_USER_IDS in the Portainer stack's "Environment variables" section,
-  # or in a gitignored .env file beside this compose for plain `docker compose`.
+  # Secrets are loaded from a gitignored `.env` file beside this compose (copy
+  # .env.example to .env and fill it in) — so the repo stays safe to push.
+  # `required: false` keeps this working on Portainer, where you instead define
+  # BOT_TOKEN / ALLOWED_USER_IDS in the stack's "Environment variables" section.
   bot:
-    build: .
-    container_name: dtb-bot
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: telehelm:latest
+    container_name: telehelm-bot
     restart: unless-stopped
     init: true            # proper PID 1 / signal handling
+    env_file:
+      - path: .env
+        required: false
     environment:
-      - BOT_TOKEN=${BOT_TOKEN}
-      - ALLOWED_USER_IDS=${ALLOWED_USER_IDS}
-      - RATE_LIMIT_MAX=20
-      - RATE_LIMIT_WINDOW_MS=60000
-      - LOG_LEVEL=info
+      # Topology is fixed here; only secrets/tunables come from .env.
+      - NODE_ENV=production
       - DOCKER_PROXY_HOST=socket-proxy
       - DOCKER_PROXY_PORT=2375
     depends_on:

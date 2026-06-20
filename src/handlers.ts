@@ -1,15 +1,27 @@
-'use strict';
-
-const { Markup } = require('telegraf');
-const d = require('./docker');
-const log = require('./logger');
+import { Markup, type Context, type Telegraf } from 'telegraf';
+import * as d from './docker';
+import log from './logger';
 
 // Verbs that mutate state require a second tap to confirm.
-const DESTRUCTIVE = new Set(['start', 'stop', 'restart']);
-const VERB_LABEL = { start: '▶️ Start', stop: '⏹️ Stop', restart: '🔄 Restart' };
-const STATE_EMOJI = { running: '🟢', exited: '🔴', paused: '🟡', created: '⚪', dead: '⚫' };
+type Verb = 'start' | 'stop' | 'restart';
+const ACTIONS: Record<Verb, (id: string) => Promise<void>> = {
+  start: d.start,
+  stop: d.stop,
+  restart: d.restart,
+};
+const isVerb = (s: string): s is Verb => s in ACTIONS;
 
-function fmtBytes(n) {
+const STATE_EMOJI: Record<string, string> = {
+  running: '🟢',
+  exited: '🔴',
+  paused: '🟡',
+  created: '⚪',
+  dead: '⚫',
+};
+
+type Keyboard = ReturnType<typeof Markup.inlineKeyboard>;
+
+function fmtBytes(n: number | undefined): string {
   if (!n) return '0 B';
   const u = ['B', 'KB', 'MB', 'GB', 'TB'];
   const i = Math.floor(Math.log(n) / Math.log(1024));
@@ -17,8 +29,8 @@ function fmtBytes(n) {
 }
 
 // Safely edit the message a callback came from; fall back to a fresh reply.
-async function render(ctx, text, keyboard) {
-  const extra = { parse_mode: 'Markdown', ...(keyboard || {}) };
+async function render(ctx: Context, text: string, keyboard?: Keyboard): Promise<void> {
+  const extra = { parse_mode: 'Markdown' as const, ...(keyboard || {}) };
   try {
     if (ctx.updateType === 'callback_query') {
       await ctx.editMessageText(text, extra);
@@ -27,7 +39,8 @@ async function render(ctx, text, keyboard) {
     }
   } catch (e) {
     // "message is not modified" and similar are non-fatal.
-    if (!/not modified/i.test(e.message)) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (!/not modified/i.test(msg)) {
       await ctx.reply(text, extra).catch(() => {});
     }
   }
@@ -35,23 +48,20 @@ async function render(ctx, text, keyboard) {
 
 // ---- Views ----------------------------------------------------------------
 
-async function listView(ctx) {
+async function listView(ctx: Context): Promise<void> {
   const containers = await d.listContainers();
   if (containers.length === 0) {
     return render(ctx, 'No containers found.');
   }
   containers.sort((a, b) => a.name.localeCompare(b.name));
   const rows = containers.map((c) => [
-    Markup.button.callback(
-      `${STATE_EMOJI[c.state] || '⚪'} ${c.name}`,
-      `c:${c.id}`
-    ),
+    Markup.button.callback(`${STATE_EMOJI[c.state] || '⚪'} ${c.name}`, `c:${c.id}`),
   ]);
   rows.push([Markup.button.callback('🔄 Refresh', 'ps')]);
   return render(ctx, '*Containers* — tap one to manage:', Markup.inlineKeyboard(rows));
 }
 
-async function menuView(ctx, id) {
+async function menuView(ctx: Context, id: string): Promise<void> {
   const c = await d.inspect(id);
   const running = c.state === 'running';
   const kb = [
@@ -65,7 +75,7 @@ async function menuView(ctx, id) {
   return render(ctx, text, Markup.inlineKeyboard(kb));
 }
 
-async function confirmView(ctx, verb, id) {
+async function confirmView(ctx: Context, verb: Verb, id: string): Promise<void> {
   const c = await d.inspect(id);
   const kb = Markup.inlineKeyboard([
     [Markup.button.callback(`✅ Yes, ${verb}`, `do:${verb}:${id}`), Markup.button.callback('❌ Cancel', `c:${id}`)],
@@ -73,7 +83,7 @@ async function confirmView(ctx, verb, id) {
   return render(ctx, `Confirm *${verb}* on *${c.name}*?`, kb);
 }
 
-async function logsView(ctx, id) {
+async function logsView(ctx: Context, id: string): Promise<void> {
   const { name, text } = await d.logs(id, 100);
   const trimmed = (text || '(no output)').slice(-3500);
   const body = `*Logs — ${name}* (last 100 lines)\n\`\`\`\n${trimmed}\n\`\`\``;
@@ -81,7 +91,7 @@ async function logsView(ctx, id) {
   return render(ctx, body, kb);
 }
 
-async function statsView(ctx, id) {
+async function statsView(ctx: Context, id: string): Promise<void> {
   const s = await d.stats(id);
   const kb = Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', `c:${id}`)]]);
   if (!s.running) {
@@ -89,38 +99,38 @@ async function statsView(ctx, id) {
   }
   const text =
     `*Stats — ${s.name}*\n` +
-    `CPU: ${s.cpuPct.toFixed(1)}%\n` +
-    `Mem: ${fmtBytes(s.memUsed)} / ${fmtBytes(s.memLimit)} (${s.memPct.toFixed(1)}%)`;
+    `CPU: ${s.cpuPct!.toFixed(1)}%\n` +
+    `Mem: ${fmtBytes(s.memUsed)} / ${fmtBytes(s.memLimit)} (${s.memPct!.toFixed(1)}%)`;
   return render(ctx, text, kb);
 }
 
-async function execute(ctx, verb, id) {
-  const who = { userId: String(ctx.from.id), username: ctx.from.username };
+async function execute(ctx: Context, verb: Verb, id: string): Promise<void> {
+  const from = ctx.from;
+  const who = { userId: from ? String(from.id) : 'unknown', username: from?.username };
   let name = id;
   try {
     const info = await d.inspect(id);
     name = info.name;
-    await d[verb](id);
+    await ACTIONS[verb](id);
     log.audit({ ...who, action: verb, target: name, result: 'ok' });
     await ctx.answerCbQuery(`${verb} ✓`).catch(() => {});
     // Brief pause so Docker settles, then show refreshed menu.
     await new Promise((r) => setTimeout(r, 600));
     return menuView(ctx, id);
   } catch (e) {
-    log.audit({ ...who, action: verb, target: name, result: 'error', detail: e.message });
+    const detail = e instanceof Error ? e.message : String(e);
+    log.audit({ ...who, action: verb, target: name, result: 'error', detail });
     await ctx.answerCbQuery('Failed').catch(() => {});
     const kb = Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', `c:${id}`)]]);
-    return render(ctx, `⚠️ *${verb}* on *${name}* failed:\n\`${e.message}\``, kb);
+    return render(ctx, `⚠️ *${verb}* on *${name}* failed:\n\`${detail}\``, kb);
   }
 }
 
 // ---- Registration ---------------------------------------------------------
 
-function register(bot) {
+export function register(bot: Telegraf<Context>): void {
   bot.start((ctx) =>
-    ctx.reply(
-      'Docker control bot ready. Use /ps to list and manage containers, /help for commands.'
-    )
+    ctx.reply('Docker control bot ready. Use /ps to list and manage containers, /help for commands.')
   );
 
   bot.help((ctx) =>
@@ -140,7 +150,7 @@ function register(bot) {
 
   // Single callback router for all inline-button taps.
   bot.on('callback_query', async (ctx) => {
-    const data = ctx.callbackQuery.data || '';
+    const data = 'data' in ctx.callbackQuery ? ctx.callbackQuery.data : '';
     try {
       if (data === 'ps') {
         await ctx.answerCbQuery().catch(() => {});
@@ -148,11 +158,11 @@ function register(bot) {
       }
       const [kind, a, b] = data.split(':');
 
-      if (kind === 'c') {
+      if (kind === 'c' && a) {
         await ctx.answerCbQuery().catch(() => {});
         return menuView(ctx, a);
       }
-      if (kind === 'a') {
+      if (kind === 'a' && a && b) {
         const verb = a;
         const id = b;
         if (verb === 'logs') {
@@ -163,21 +173,20 @@ function register(bot) {
           await ctx.answerCbQuery('Sampling…').catch(() => {});
           return statsView(ctx, id);
         }
-        if (DESTRUCTIVE.has(verb)) {
+        if (isVerb(verb)) {
           await ctx.answerCbQuery().catch(() => {});
           return confirmView(ctx, verb, id);
         }
       }
-      if (kind === 'do' && DESTRUCTIVE.has(a)) {
+      if (kind === 'do' && a && b && isVerb(a)) {
         return execute(ctx, a, b);
       }
       await ctx.answerCbQuery().catch(() => {});
     } catch (e) {
-      log.error('callback_error', { data, error: e.message });
+      const msg = e instanceof Error ? e.message : String(e);
+      log.error('callback_error', { data, error: msg });
       await ctx.answerCbQuery('Error').catch(() => {});
-      await ctx.reply(`⚠️ Error: ${e.message}`).catch(() => {});
+      await ctx.reply(`⚠️ Error: ${msg}`).catch(() => {});
     }
   });
 }
-
-module.exports = { register };

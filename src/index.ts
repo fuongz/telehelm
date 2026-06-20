@@ -1,10 +1,8 @@
-'use strict';
-
-const { Telegraf } = require('telegraf');
-const { authMiddleware } = require('./auth');
-const { register } = require('./handlers');
-const d = require('./docker');
-const log = require('./logger');
+import { Telegraf, type Context } from 'telegraf';
+import { authMiddleware } from './auth';
+import { register } from './handlers';
+import * as d from './docker';
+import log from './logger';
 
 const token = process.env.BOT_TOKEN;
 if (!token) {
@@ -12,7 +10,7 @@ if (!token) {
   process.exit(1);
 }
 
-const bot = new Telegraf(token);
+const bot = new Telegraf<Context>(token);
 
 // Auth + rate limit run before any handler sees the update.
 bot.use(authMiddleware());
@@ -20,16 +18,18 @@ bot.use(authMiddleware());
 register(bot);
 
 bot.catch((err, ctx) => {
-  log.error('bot_error', { error: err.message, updateType: ctx && ctx.updateType });
+  const msg = err instanceof Error ? err.message : String(err);
+  log.error('bot_error', { error: msg, updateType: ctx?.updateType });
 });
 
-async function main() {
+async function main(): Promise<void> {
   // Verify the proxy path works before we start accepting commands.
   try {
     await d.ping();
     log.info('docker_proxy_ok');
   } catch (e) {
-    log.error('docker_proxy_unreachable', { error: e.message });
+    const msg = e instanceof Error ? e.message : String(e);
+    log.error('docker_proxy_unreachable', { error: msg });
     // Don't exit — Telegram may still be useful and the proxy might come up.
   }
 
@@ -39,7 +39,7 @@ async function main() {
 }
 
 // Graceful shutdown so Telegram releases the polling session cleanly.
-function shutdown(sig) {
+function shutdown(sig: NodeJS.Signals): void {
   log.info('shutdown', { signal: sig });
   bot.stop(sig);
   process.exit(0);
@@ -48,6 +48,7 @@ process.once('SIGINT', () => shutdown('SIGINT'));
 process.once('SIGTERM', () => shutdown('SIGTERM'));
 
 main().catch((e) => {
-  log.error('fatal', { error: e.message });
+  const msg = e instanceof Error ? e.message : String(e);
+  log.error('fatal', { error: msg });
   process.exit(1);
 });
