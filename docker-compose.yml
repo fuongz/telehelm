@@ -1,0 +1,80 @@
+services:
+  # --- Socket proxy: the only thing that touches the real Docker socket ------
+  # LinuxServer.io fork is used because its ALLOW_START / ALLOW_STOP /
+  # ALLOW_RESTARTS flags actually gate those POSTs WITHOUT enabling blanket
+  # POST=1 (which would also unlock container create, exec, etc.).
+  socket-proxy:
+    image: lscr.io/linuxserver/socket-proxy:latest
+    container_name: dtb-socket-proxy
+    restart: unless-stopped
+    environment:
+      # Read access (covers ps / inspect / logs / stats):
+      - CONTAINERS=1
+      # Lifecycle writes — granular, POST stays 0:
+      - POST=0
+      - ALLOW_START=1
+      - ALLOW_STOP=1
+      - ALLOW_RESTARTS=1
+      # Everything below is explicitly denied (also the image defaults):
+      - EXEC=0
+      - IMAGES=0
+      - BUILD=0
+      - COMMIT=0
+      - VOLUMES=0
+      - NETWORKS=0
+      - SECRETS=0
+      - CONFIGS=0
+      - SWARM=0
+      - SYSTEM=0
+      - INFO=0
+      - AUTH=0
+      - DISTRIBUTION=0
+      - PLUGINS=0
+      - NODES=0
+      - SERVICES=0
+      - TASKS=0
+    volumes:
+      # :ro stops replacement of the socket file. It does NOT make the API
+      # read-only — that is governed entirely by the flags above.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - internal          # NO egress network -> proxy cannot reach the internet
+    security_opt:
+      - no-new-privileges:true
+
+  # --- Bot: reaches Telegram outbound, reaches Docker only via the proxy -----
+  # Secrets come from the environment (e.g. Portainer stack env vars), NOT from
+  # this file — so the repo stays safe to push. Define BOT_TOKEN and
+  # ALLOWED_USER_IDS in the Portainer stack's "Environment variables" section,
+  # or in a gitignored .env file beside this compose for plain `docker compose`.
+  bot:
+    build: .
+    container_name: dtb-bot
+    restart: unless-stopped
+    init: true            # proper PID 1 / signal handling
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - ALLOWED_USER_IDS=${ALLOWED_USER_IDS}
+      - RATE_LIMIT_MAX=20
+      - RATE_LIMIT_WINDOW_MS=60000
+      - LOG_LEVEL=info
+      - DOCKER_PROXY_HOST=socket-proxy
+      - DOCKER_PROXY_PORT=2375
+    depends_on:
+      - socket-proxy
+    networks:
+      - internal          # to talk to the proxy
+      - egress            # to talk to Telegram (long polling, outbound only)
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+
+networks:
+  internal:
+    internal: true        # air-gapped: members get no route to the internet
+  egress:
+    driver: bridge

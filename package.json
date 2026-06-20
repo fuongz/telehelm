@@ -1,0 +1,36 @@
+{
+  "name": "telehelm",
+  "version": "1.0.0",
+  "description": "Control a homelab Docker host from Telegram, via a least-privilege socket proxy.",
+  "main": "src/index.js",
+  "type": "commonjs",
+  "keywords": [
+    "telegram",
+    "telegram-bot",
+    "docker",
+    "homelab",
+    "socket-proxy",
+    "telegraf",
+    "dockerode"
+  ],
+  "homepage": "https://github.com/fuongz/telehelm#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fuongz/telehelm.git"
+  },
+  "bugs": {
+    "url": "https://github.com/fuongz/telehelm/issues"
+  },
+  "author": "fuongz <hi@phuongphung.com>",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "dockerode": "^4.0.2",
+    "telegraf": "^4.16.3"
+  },
+  "license": "MIT"
+}
