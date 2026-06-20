@@ -82,6 +82,8 @@ services:
       - NODE_ENV=production
       - DOCKER_PROXY_HOST=socket-proxy
       - DOCKER_PROXY_PORT=2375
+      # Where log-monitor definitions are persisted (on the `monitors` volume).
+      - MONITORS_FILE=/data/monitors.json
     depends_on:
       socket-proxy:
         condition: service_healthy
@@ -95,9 +97,17 @@ services:
     read_only: true
     tmpfs:
       - /tmp
+    volumes:
+      # Persists log-monitor definitions across restarts/updates. The rootfs is
+      # read-only, so this is the one writable path; it inherits `bun` (uid
+      # 1000) ownership from the image's /data dir (see Dockerfile).
+      - monitors:/data
 
 networks:
   internal:
     internal: true        # air-gapped: members get no route to the internet
   egress:
     driver: bridge
+
+volumes:
+  monitors:
