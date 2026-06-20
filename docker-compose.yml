@@ -12,6 +12,9 @@ services:
     container_name: telehelm-socket-proxy
     restart: unless-stopped
     environment:
+      # Health/liveness probe (GET /_ping) — used by the bot and the
+      # healthcheck below. Discloses nothing beyond "the daemon is up".
+      - PING=1
       # Read access (covers ps / inspect / logs / stats):
       - CONTAINERS=1
       # Lifecycle writes — granular, POST stays 0:
@@ -45,6 +48,14 @@ services:
       - internal          # NO egress network -> proxy cannot reach the internet
     security_opt:
       - no-new-privileges:true
+    healthcheck:
+      # Backend is "up" only once HAProxy can reach the Docker socket. The bot
+      # waits on this (depends_on: service_healthy) so it never pings too early.
+      test: ["CMD", "wget", "--quiet", "--spider", "http://localhost:2375/_ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
 
   # --- Bot: reaches Telegram outbound, reaches Docker only via the proxy -----
   # Secrets are loaded from a gitignored `.env` file beside this compose (copy
@@ -69,7 +80,8 @@ services:
       - DOCKER_PROXY_HOST=socket-proxy
       - DOCKER_PROXY_PORT=2375
     depends_on:
-      - socket-proxy
+      socket-proxy:
+        condition: service_healthy
     networks:
       - internal          # to talk to the proxy
       - egress            # to talk to Telegram (long polling, outbound only)
