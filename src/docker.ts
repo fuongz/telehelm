@@ -56,6 +56,14 @@ export async function listContainers(): Promise<ContainerSummary[]> {
 	}));
 }
 
+// Find a container by its exact name (no leading slash) and return its SHORT
+// id, or undefined if none matches. Lets a monitor recover when its target was
+// recreated (stop/start, `compose up`, etc.) and came back with a new id.
+export async function findIdByName(name: string): Promise<string | undefined> {
+	const all = await listContainers();
+	return all.find((c) => c.name === name)?.id;
+}
+
 export async function inspect(id: string): Promise<ContainerDetail> {
 	const data = await docker.getContainer(id).inspect();
 	return {

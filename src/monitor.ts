@@ -147,6 +147,13 @@ function segment(text: string, firstlineRe?: RegExp): string[] {
 	return blocks;
 }
 
+// A stop/start or `compose up` recreates the container under a new id, so the
+// old id 404s. Detect that specific failure so we can re-resolve by name
+// instead of treating it as a real error and auto-disabling the monitor.
+function isContainerGone(detail: string): boolean {
+	return /no such container|404/i.test(detail);
+}
+
 // Test a regex against a unit, bounding the input length so worst-case
 // backtracking time stays bounded (see MAX_MATCH_LEN).
 function safeTest(re: RegExp, s: string): boolean {
@@ -276,8 +283,34 @@ async function check(m: Monitor): Promise<void> {
 		}
 		persist();
 	} catch (e) {
-		m.fails += 1;
 		const detail = e instanceof Error ? e.message : String(e);
+
+		// The container may just have been recreated with a new id (stop/start,
+		// `compose up`). Try to rebind to the current container of the same name
+		// before counting this as a failure. Watch the rebound container from now
+		// forward so its startup logs don't flood in as a backlog.
+		if (isContainerGone(detail)) {
+			try {
+				const newId = await d.findIdByName(m.containerName);
+				if (newId && newId !== m.containerId) {
+					log.info("monitor_rebind", {
+						id: m.id,
+						container: m.containerName,
+						oldId: m.containerId,
+						newId,
+					});
+					m.containerId = newId;
+					m.lastCheck = now;
+					m.fails = 0;
+					persist();
+					return; // next tick polls the new container
+				}
+			} catch {
+				// fall through to normal failure handling below
+			}
+		}
+
+		m.fails += 1;
 		log.warn("monitor_check_failed", {
 			id: m.id,
 			container: m.containerName,
