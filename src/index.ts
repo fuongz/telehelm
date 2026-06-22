@@ -36,9 +36,12 @@ async function main(): Promise<void> {
 
 	// Restore saved log monitors and start their pollers. Notifications are sent
 	// via the bot's outbound Telegram channel, the same path commands reply on.
-	initMonitors((chatId, text) =>
+	initMonitors((chatId, text, buttons) =>
 		bot.telegram
-			.sendMessage(chatId, text, { parse_mode: "Markdown" })
+			.sendMessage(chatId, text, {
+				parse_mode: "Markdown",
+				...(buttons ? { reply_markup: { inline_keyboard: buttons } } : {}),
+			})
 			.then(() => {}),
 	);
 

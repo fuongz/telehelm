@@ -109,10 +109,10 @@ async function confirmView(
 	return render(ctx, `Confirm *${verb}* on *${c.name}*?`, kb);
 }
 
-async function logsView(ctx: Context, id: string): Promise<void> {
-	const { name, text } = await d.logs(id, 100);
+async function logsView(ctx: Context, id: string, tail = 100): Promise<void> {
+	const { name, text } = await d.logs(id, tail);
 	const trimmed = (text || "(no output)").slice(-3500);
-	const body = `*Logs — ${name}* (last 100 lines)\n\`\`\`\n${trimmed}\n\`\`\``;
+	const body = `*Logs — ${name}* (last ${tail} lines)\n\`\`\`\n${trimmed}\n\`\`\``;
 	const kb = Markup.inlineKeyboard([
 		[Markup.button.callback("⬅️ Back", `c:${id}`)],
 	]);
@@ -432,6 +432,11 @@ export function register(bot: Telegraf<Context>): void {
 				if (verb === "logs") {
 					await ctx.answerCbQuery("Fetching…").catch(() => {});
 					return logsView(ctx, id);
+				}
+				// 50-line tail, fired from a monitor alert's 📄 Logs button.
+				if (verb === "logs50") {
+					await ctx.answerCbQuery("Fetching…").catch(() => {});
+					return logsView(ctx, id, 50);
 				}
 				if (verb === "stats") {
 					await ctx.answerCbQuery("Sampling…").catch(() => {});

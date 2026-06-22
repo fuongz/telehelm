@@ -32,9 +32,20 @@ export interface Monitor {
 	fails: number; // consecutive poll errors, for auto-disable
 }
 
-// (chatId, markdown text) -> delivered. Injected at init so this module never
-// imports Telegraf directly.
-type SendFn = (chatId: number, text: string) => Promise<void>;
+// An inline-keyboard button: visible label + the callback_data the bot's router
+// understands. Kept as a plain shape so this module never imports Telegraf.
+export interface Button {
+	text: string;
+	callback_data: string;
+}
+
+// (chatId, markdown text, optional inline-keyboard rows) -> delivered. Injected
+// at init so this module never imports Telegraf directly.
+type SendFn = (
+	chatId: number,
+	text: string,
+	buttons?: Button[][],
+) => Promise<void>;
 
 const FILE = process.env.MONITORS_FILE || "/data/monitors.json";
 const MIN_INTERVAL = parseInt(process.env.MONITOR_MIN_INTERVAL || "5", 10);
@@ -363,7 +374,16 @@ async function notify(
 		`Pattern: \`${m.pattern}\`\n` +
 		`${lines.length} new matching line(s):${backlog}\n` +
 		`\`\`\`\n${body}${more}\n\`\`\``;
-	await send(m.chatId, text).catch((e) => {
+	// Quick actions on the alert itself: restart (routes through the usual
+	// confirm step) and a 50-line log tail. callback_data mirrors the buttons
+	// the handlers' router already understands.
+	const buttons: Button[][] = [
+		[
+			{ text: "🔄 Restart", callback_data: `a:restart:${m.containerId}` },
+			{ text: "📄 Logs", callback_data: `a:logs50:${m.containerId}` },
+		],
+	];
+	await send(m.chatId, text, buttons).catch((e) => {
 		log.warn("monitor_notify_failed", {
 			id: m.id,
 			error: e instanceof Error ? e.message : String(e),
