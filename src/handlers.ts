@@ -151,7 +151,8 @@ function fmtMonitor(m: mon.Monitor): string {
 	const min = m.minMatches > 1 ? ` · ≥${m.minMatches}/check` : "";
 	const ml = m.multiline ? " · multiline" : "";
 	const ign = m.ignore ? ` · ignore \`/${m.ignore}/\`` : "";
-	return `${dot} \`/${m.pattern}/\` every ${m.intervalSec}s · cooldown ${m.cooldownSec}s${min}${ml}${ign}`;
+	const rs = m.restartOnMatch ? " · 🔄 auto-restart" : "";
+	return `${dot} \`/${m.pattern}/\` every ${m.intervalSec}s · cooldown ${m.cooldownSec}s${min}${ml}${ign}${rs}`;
 }
 
 // Parse a monitor spec from the user's reply. Line 1 is `<interval> <regex>`;
@@ -176,6 +177,7 @@ function parseSpec(text: string): mon.SpecInput {
 		if (cd) spec.cooldownSec = parseInt(cd, 10);
 		const mn = /^min:\s*(\d+)\s*$/i.exec(ln)?.[1];
 		if (mn) spec.minMatches = parseInt(mn, 10);
+		if (/^restart:\s*(on|true|yes|1)\s*$/i.test(ln)) spec.restartOnMatch = true;
 	}
 	return spec;
 }
@@ -220,7 +222,8 @@ async function monitorAddPrompt(ctx: Context, id: string): Promise<void> {
 		"`ignore: healthcheck|debug` — skip noisy lines\n" +
 		"`cooldown: 600` — min seconds between alerts\n" +
 		"`min: 5` — only alert if ≥N matches in one check\n" +
-		"`multiline: ^\\d{4}-\\d{2}-\\d{2}` — group stack traces into one alert\n\n" +
+		"`multiline: ^\\d{4}-\\d{2}-\\d{2}` — group stack traces into one alert\n" +
+		"`restart: on` — restart the container when it matches (default off)\n\n" +
 		"I'll show a preview of recent matches before creating it.\n" +
 		"Send /cancel to abort.";
 	const kb = Markup.inlineKeyboard([
@@ -293,6 +296,7 @@ async function handleMonitorReply(
 		`Every ${spec.intervalSec}s` +
 		(spec.cooldownSec !== undefined ? `, cooldown ${spec.cooldownSec}s` : "") +
 		(spec.minMatches !== undefined ? `, ≥${spec.minMatches}/check` : "") +
+		(spec.restartOnMatch ? "\n⚠️ Auto-restart: *on* — will restart the container on match" : "") +
 		"\n\n";
 	const kb = Markup.inlineKeyboard([
 		[

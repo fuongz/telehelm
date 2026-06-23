@@ -20,6 +20,7 @@ export interface Monitor {
 	pattern: string; // regex source — a line (or block) must match this
 	ignore?: string; // optional regex — a matching line/block is excluded (noise filter)
 	multiline?: string; // optional "firstline" regex — groups multi-line blocks (stack traces)
+	restartOnMatch?: boolean; // when true, restart the container after an alert fires (off by default)
 	intervalSec: number;
 	cooldownSec: number; // min seconds between notifications, to prevent storms
 	minMatches: number; // min matching units in one check before alerting (debounce)
@@ -104,6 +105,7 @@ function load(): void {
 				...raw,
 				cooldownSec: raw.cooldownSec ?? DEFAULT_COOLDOWN,
 				minMatches: raw.minMatches ?? 1,
+				restartOnMatch: raw.restartOnMatch ?? false,
 				lastNotify: raw.lastNotify ?? 0,
 				suppressed: raw.suppressed ?? 0,
 			};
@@ -126,6 +128,7 @@ export interface SpecInput {
 	cooldownSec?: number;
 	multiline?: string;
 	minMatches?: number;
+	restartOnMatch?: boolean;
 }
 
 interface Compiled {
@@ -290,6 +293,10 @@ async function check(m: Monitor): Promise<void> {
 				await notify(m, matched, m.suppressed);
 				m.lastNotify = now;
 				m.suppressed = 0;
+				// Optional remediation, armed per-monitor. It lives inside the
+				// cooldown+threshold gate, so a flapping line restarts at most
+				// once per cooldown window rather than looping.
+				if (m.restartOnMatch) await autoRestart(m);
 			}
 		}
 		persist();
@@ -391,6 +398,39 @@ async function notify(
 	});
 }
 
+// Restart the watched container as an automatic remediation after an alert.
+// Called only from inside the cooldown+threshold gate in check(), so it can't
+// loop on a flapping line. Audited like any other lifecycle action, and the
+// outcome (success or failure) is reported to the same chat as the alert.
+async function autoRestart(m: Monitor): Promise<void> {
+	try {
+		await d.restart(m.containerId);
+		log.audit({
+			userId: "system",
+			action: "monitor_autorestart",
+			target: `${m.containerName} /${m.pattern}/`,
+			result: "ok",
+		});
+		await send(
+			m.chatId,
+			`🔄 Auto-restart triggered for *${m.containerName}* (monitor matched).`,
+		).catch(() => {});
+	} catch (e) {
+		const detail = e instanceof Error ? e.message : String(e);
+		log.audit({
+			userId: "system",
+			action: "monitor_autorestart",
+			target: `${m.containerName} /${m.pattern}/`,
+			result: "error",
+			detail,
+		});
+		await send(
+			m.chatId,
+			`⚠️ Auto-restart of *${m.containerName}* failed:\n\`${detail}\``,
+		).catch(() => {});
+	}
+}
+
 function startTimer(m: Monitor): void {
 	stopTimer(m.id);
 	if (!m.enabled) return;
@@ -442,6 +482,7 @@ export function addMonitor(input: AddInput): Monitor {
 		pattern: input.pattern,
 		ignore: input.ignore?.trim() || undefined,
 		multiline: input.multiline?.trim() || undefined,
+		restartOnMatch: input.restartOnMatch ?? false,
 		intervalSec: input.intervalSec,
 		cooldownSec: input.cooldownSec ?? DEFAULT_COOLDOWN,
 		minMatches: input.minMatches ?? 1,
@@ -459,7 +500,9 @@ export function addMonitor(input: AddInput): Monitor {
 	log.audit({
 		userId: input.createdBy,
 		action: "monitor_add",
-		target: `${input.containerName} /${input.pattern}/ @${input.intervalSec}s`,
+		target:
+			`${input.containerName} /${input.pattern}/ @${input.intervalSec}s` +
+			(m.restartOnMatch ? " +auto-restart" : ""),
 		result: "ok",
 	});
 	return m;

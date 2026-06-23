@@ -91,11 +91,13 @@ Set one up entirely from Telegram:
    cooldown: 600
    min: 5
    multiline: ^\d{4}-\d{2}-\d{2}
+   restart: on
    ```
    - `ignore:` — a second regex; lines matching it are skipped (silence known-noisy output).
    - `cooldown:` — minimum seconds between alerts for this monitor (defaults to `MONITOR_DEFAULT_COOLDOWN`).
    - `min:` — only alert if at least N matches occur in a single check; the check interval is the effective window, so a lone transient line stays quiet while a burst fires.
    - `multiline:` — a "firstline" regex marking the start of a log block. Lines that don't match it are folded into the preceding block, so a stack trace becomes **one** alert instead of one per line. The match/ignore regexes then test the whole block.
+   - `restart:` — `on` (or `true`/`yes`/`1`) makes the monitor **restart the container** whenever it alerts. Off by default. The restart fires from inside the same threshold + cooldown gate as the alert, so it runs at most once per cooldown window — never in a tight loop. The preview screen flags this before you confirm.
 3. The bot shows a **dry-run preview** — what the pattern would have matched in the recent log tail — then a **✅ Create / ❌ Cancel** choice before anything is saved.
 4. Manage existing monitors from the same view: **⏸️ Pause / ▶️ Resume** and **🗑️ Delete**.
 
@@ -106,11 +108,12 @@ Details:
 - **Cooldown / anti-storm.** After an alert fires, further matches are counted but not sent until the cooldown elapses; the next alert notes how many were suppressed. This stops a fast-flapping line from flooding the chat.
 - **Threshold debounce (`min:`).** Require N matches within a single check before alerting, so a one-off transient is ignored and only a real burst pages you.
 - **Multi-line matching (`multiline:`).** Group stack traces and other multi-line records into a single alert via a firstline regex, instead of one alert per line.
+- **Auto-restart (`restart: on`).** Optionally restart the watched container when a monitor alerts — automatic remediation for a crash-looped or wedged service. Gated by the same threshold + cooldown as the alert (so it can't restart-loop), audited as `monitor_autorestart`, and the outcome is reported back to the chat.
 - **Restart catch-up.** The last-checked timestamp is persisted, so on startup each monitor immediately scans the gap since the bot was last up — you don't miss (or wait a full interval for) matches that occurred during downtime.
 - Notifications cap at the first 10 matching lines per check to stay within Telegram's message limits.
 - A monitor that fails its check 5 times in a row (e.g. the container was removed) auto-disables and tells you why.
 - **Bounded by design.** A check won't start while the previous one is still running (no stacking on a slow Docker call); the total monitor count is capped (`MONITOR_MAX`); each log line/block is length-capped (`MONITOR_MAX_MATCH_LEN`) before matching and obviously catastrophic patterns (e.g. `(a+)+`) are rejected at add time, to bound regex backtracking.
-- **Audited.** Creating, pausing/resuming, deleting, and auto-disabling a monitor each emit an `audit` log line with the acting user.
+- **Audited.** Creating, pausing/resuming, deleting, auto-disabling, and auto-restarting a monitor each emit an `audit` log line with the acting user (`system` for automatic actions).
 - Definitions persist to `/data/monitors.json` on the `monitors` volume, so they survive bot restarts and updates. If that path can't be written the bot falls back to in-memory monitors and logs `monitor_persist_disabled`.
 
 ## What the bot can and cannot do
