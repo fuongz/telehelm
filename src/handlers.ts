@@ -143,15 +143,23 @@ async function statsView(ctx: Context, id: string): Promise<void> {
 const PROMPT_TTL_MS = 5 * 60 * 1000;
 const awaiting = new Map<
 	string,
-	{ containerId: string; expires: number; spec?: mon.SpecInput }
+	{
+		containerId: string;
+		expires: number;
+		kind?: "regex" | "silence";
+		spec?: mon.SpecInput;
+	}
 >();
 
 function fmtMonitor(m: mon.Monitor): string {
 	const dot = m.enabled ? "🟢" : "⚪";
+	const rs = m.restartOnMatch ? " · 🔄 auto-restart" : "";
+	if (m.type === "silence") {
+		return `${dot} 🔕 silence ≥${m.silenceSec}s · checks every ${m.intervalSec}s · cooldown ${m.cooldownSec}s${rs}`;
+	}
 	const min = m.minMatches > 1 ? ` · ≥${m.minMatches}/check` : "";
 	const ml = m.multiline ? " · multiline" : "";
 	const ign = m.ignore ? ` · ignore \`/${m.ignore}/\`` : "";
-	const rs = m.restartOnMatch ? " · 🔄 auto-restart" : "";
 	return `${dot} \`/${m.pattern}/\` every ${m.intervalSec}s · cooldown ${m.cooldownSec}s${min}${ml}${ign}${rs}`;
 }
 
@@ -182,6 +190,30 @@ function parseSpec(text: string): mon.SpecInput {
 	return spec;
 }
 
+// Parse a silence-watch spec. Line 1 is the threshold in seconds; optional
+// follow-up lines tune it: `interval: <n>`, `cooldown: <n>`, `restart: on`. The
+// check interval defaults to min(60, threshold) so silence is caught promptly
+// without polling more often than the threshold.
+function parseSilenceSpec(text: string): mon.SpecInput {
+	const lines = text.split("\n");
+	const silenceSec = parseInt((lines[0] || "").trim(), 10);
+	const spec: mon.SpecInput = {
+		type: "silence",
+		pattern: "",
+		silenceSec,
+		intervalSec: Number.isFinite(silenceSec) ? Math.min(60, silenceSec) : 60,
+	};
+	for (const raw of lines.slice(1)) {
+		const ln = raw.trim();
+		const iv = /^interval:\s*(\d+)\s*$/i.exec(ln)?.[1];
+		if (iv) spec.intervalSec = parseInt(iv, 10);
+		const cd = /^cooldown:\s*(\d+)\s*$/i.exec(ln)?.[1];
+		if (cd) spec.cooldownSec = parseInt(cd, 10);
+		if (/^restart:\s*(on|true|yes|1)\s*$/i.test(ln)) spec.restartOnMatch = true;
+	}
+	return spec;
+}
+
 async function monitorView(ctx: Context, id: string): Promise<void> {
 	const c = await d.inspect(id);
 	const list = mon.listMonitors(id);
@@ -193,6 +225,7 @@ async function monitorView(ctx: Context, id: string): Promise<void> {
 		Markup.button.callback("🗑️ Delete", `mon:del:${m.id}`),
 	]);
 	rows.push([Markup.button.callback("➕ Add monitor", `mon:add:${id}`)]);
+	rows.push([Markup.button.callback("🔕 Silence watch", `mon:adds:${id}`)]);
 	rows.push([Markup.button.callback("⬅️ Back", `c:${id}`)]);
 
 	const lines = list.length
@@ -200,8 +233,9 @@ async function monitorView(ctx: Context, id: string): Promise<void> {
 		: "_No monitors yet._";
 	const text =
 		`*Monitors — ${c.name}*\n${lines}\n\n` +
-		"A monitor checks new logs every N seconds and pings you when a line " +
-		"matches its regex.";
+		"A monitor pings you about new logs: an *➕ Add monitor* regex watch fires " +
+		"when a line matches, a *🔕 Silence watch* fires when the container stops " +
+		"producing logs for too long (a heartbeat / stuck-container check).";
 	return render(ctx, text, Markup.inlineKeyboard(rows));
 }
 
@@ -212,6 +246,7 @@ async function monitorAddPrompt(ctx: Context, id: string): Promise<void> {
 	awaiting.set(String(from.id), {
 		containerId: id,
 		expires: Date.now() + PROMPT_TTL_MS,
+		kind: "regex",
 	});
 	const c = await d.inspect(id);
 	const text =
@@ -226,6 +261,34 @@ async function monitorAddPrompt(ctx: Context, id: string): Promise<void> {
 		"`restart: on` — restart the container when it matches (default off)\n\n" +
 		"I'll show a preview of recent matches before creating it.\n" +
 		"Send /cancel to abort.";
+	const kb = Markup.inlineKeyboard([
+		[Markup.button.callback("❌ Cancel", `a:mon:${id}`)],
+	]);
+	return render(ctx, text, kb);
+}
+
+// Begin the silence-watch add flow: ask for a threshold (and optional tuning).
+async function monitorSilenceAddPrompt(ctx: Context, id: string): Promise<void> {
+	const from = ctx.from;
+	if (!from) return;
+	awaiting.set(String(from.id), {
+		containerId: id,
+		expires: Date.now() + PROMPT_TTL_MS,
+		kind: "silence",
+	});
+	const c = await d.inspect(id);
+	const text =
+		`*Silence watch — ${c.name}*\n` +
+		"Alerts when the container stops producing logs for too long " +
+		"(a heartbeat / stuck-container check).\n\n" +
+		"Reply with the silence threshold in seconds, e.g.\n" +
+		"`300`\n\n" +
+		"Optional extra lines:\n" +
+		"`interval: 60` — how often to check (default min(60, threshold))\n" +
+		"`cooldown: 600` — min seconds between alerts\n" +
+		"`restart: on` — restart the container when it goes silent (default off)\n\n" +
+		"Only fires while the container is *running* (a stopped one is quiet on " +
+		"purpose).\nSend /cancel to abort.";
 	const kb = Markup.inlineKeyboard([
 		[Markup.button.callback("❌ Cancel", `a:mon:${id}`)],
 	]);
@@ -256,13 +319,39 @@ async function handleMonitorReply(
 		return true;
 	}
 
-	const spec = parseSpec(text);
+	const silence = pending.kind === "silence";
+	const spec = silence ? parseSilenceSpec(text) : parseSpec(text);
 	try {
 		mon.validate(spec);
 	} catch (e) {
 		// Keep the prompt open so the user can correct and resend.
 		const msg = e instanceof Error ? e.message : String(e);
 		await ctx.reply(`⚠️ ${msg}\nTry again, or /cancel.`);
+		return true;
+	}
+
+	// Silence watch: no regex to dry-run — just confirm the threshold and show
+	// the container's current state, then offer Create.
+	if (silence) {
+		pending.spec = spec;
+		pending.expires = Date.now() + PROMPT_TTL_MS;
+		const info = await d.inspect(pending.containerId);
+		const head =
+			`*Silence watch — ${info.name}*\n` +
+			`Alerts if no new logs for ≥${spec.silenceSec}s\n` +
+			`Checks every ${spec.intervalSec}s` +
+			(spec.cooldownSec !== undefined ? `, cooldown ${spec.cooldownSec}s` : "") +
+			(spec.restartOnMatch
+				? "\n⚠️ Auto-restart: *on* — will restart the container when silent"
+				: "") +
+			`\n\nContainer is currently *${info.state}*.`;
+		const kb = Markup.inlineKeyboard([
+			[
+				Markup.button.callback("✅ Create", `mon:ok:${pending.containerId}`),
+				Markup.button.callback("❌ Cancel", `a:mon:${pending.containerId}`),
+			],
+		]);
+		await ctx.reply(head, { parse_mode: "Markdown", ...kb });
 		return true;
 	}
 
@@ -397,8 +486,9 @@ export function register(bot: Telegraf<Context>): void {
 				"/watches — list all active log monitors",
 				"",
 				"From a container you can view Logs, Stats, Start/Stop/Restart,",
-				"and set up 🔔 Monitor — a regex watch on new log lines that pings",
-				"you when it matches. Lifecycle actions ask for confirmation first.",
+				"and set up 🔔 Monitor — either a regex watch on new log lines, or a",
+				"🔕 Silence watch that pings you when the container stops logging",
+				"(a heartbeat / stuck-container check). Lifecycle actions confirm first.",
 			].join("\n"),
 			{ parse_mode: "Markdown" },
 		),
@@ -465,6 +555,10 @@ export function register(bot: Telegraf<Context>): void {
 				if (a === "add") {
 					await ctx.answerCbQuery().catch(() => {});
 					return monitorAddPrompt(ctx, b);
+				}
+				if (a === "adds") {
+					await ctx.answerCbQuery().catch(() => {});
+					return monitorSilenceAddPrompt(ctx, b);
 				}
 				if (a === "ok") {
 					return monitorCreate(ctx, b);

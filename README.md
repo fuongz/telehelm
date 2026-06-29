@@ -101,6 +101,26 @@ Set one up entirely from Telegram:
 3. The bot shows a **dry-run preview** — what the pattern would have matched in the recent log tail — then a **✅ Create / ❌ Cancel** choice before anything is saved.
 4. Manage existing monitors from the same view: **⏸️ Pause / ▶️ Resume** and **🗑️ Delete**.
 
+#### Silence watches (heartbeat)
+
+A regex monitor catches *bad* output. A **silence watch** catches the opposite failure: a container that **stops producing logs** — wedged on a failed reconnect, a hung request, or a stalled loop. It pings you when no new logs have appeared for longer than a threshold you set.
+
+1. `/ps` → tap a container → **🔔 Monitor** → **🔕 Silence watch**.
+2. Reply with the silence threshold in seconds; optional extra lines tune it:
+   ```
+   300
+   interval: 60
+   cooldown: 600
+   restart: on
+   ```
+   - threshold (line 1) — alert if no new logs arrive for this many seconds.
+   - `interval:` — how often to check; defaults to `min(60, threshold)` so silence is caught promptly without polling more often than the threshold.
+   - `cooldown:` — minimum seconds between alerts (same anti-storm gate as regex monitors).
+   - `restart:` — `on` to auto-restart the container when it goes silent — direct remediation for a stuck service. Off by default, gated by the cooldown so it can't restart-loop.
+3. Only fires while the container is **running** — a stopped container is quiet on purpose, not stuck. When logs resume, you get a **✅ Logs resumed** recovery message.
+
+Both kinds appear together in the container's monitor list and in `/watches`.
+
 Details:
 
 - Matching is **case-sensitive** (the pattern is compiled as `new RegExp(pattern)` with no flags) and tested per log line.
@@ -123,6 +143,7 @@ Details:
 | List / inspect containers | ✅ |
 | View logs, stats | ✅ |
 | Watch logs for a regex, get alerts | ✅ |
+| Alert when a container stops logging (silence/heartbeat) | ✅ |
 | Start / stop / restart | ✅ |
 | Create / run new containers | ❌ blocked at proxy |
 | `exec` into a container | ❌ blocked at proxy |

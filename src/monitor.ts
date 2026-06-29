@@ -17,10 +17,16 @@ export interface Monitor {
 	id: string; // short, opaque — also used in callback_data
 	containerId: string; // SHORT (12-char) id, as everything else uses
 	containerName: string; // cached for display; refreshed on match
-	pattern: string; // regex source — a line (or block) must match this
+	// Monitor kind. Absent (or "regex") = the original pattern watch. "silence"
+	// = a heartbeat watch that alerts when the container stops producing logs.
+	type?: "regex" | "silence";
+	pattern: string; // regex source — a line (or block) must match this (unused for silence)
 	ignore?: string; // optional regex — a matching line/block is excluded (noise filter)
 	multiline?: string; // optional "firstline" regex — groups multi-line blocks (stack traces)
 	restartOnMatch?: boolean; // when true, restart the container after an alert fires (off by default)
+	silenceSec?: number; // silence watch: alert if no new logs for this many seconds
+	lastLogAt?: number; // silence watch: unix seconds when output was last seen
+	alarming?: boolean; // silence watch: true while a silence alert is active, so recovery fires once
 	intervalSec: number;
 	cooldownSec: number; // min seconds between notifications, to prevent storms
 	minMatches: number; // min matching units in one check before alerting (debounce)
@@ -122,6 +128,7 @@ function load(): void {
 // The tunable shape of a monitor — shared by validate(), preview(), and the
 // add flow so new fields only have to be threaded through one type.
 export interface SpecInput {
+	type?: "regex" | "silence";
 	pattern: string;
 	intervalSec: number;
 	ignore?: string;
@@ -129,6 +136,7 @@ export interface SpecInput {
 	multiline?: string;
 	minMatches?: number;
 	restartOnMatch?: boolean;
+	silenceSec?: number; // required when type === "silence"
 }
 
 interface Compiled {
@@ -188,8 +196,9 @@ function assertSafeRegex(src: string | undefined, label: string): void {
 	}
 }
 
-// Throws a user-facing Error on bad input; returns the compiled regexes on ok.
-export function validate(s: SpecInput): Compiled {
+// Throws a user-facing Error on bad input; returns the compiled regexes for a
+// regex monitor, or void for a silence monitor (which has no pattern).
+export function validate(s: SpecInput): Compiled | void {
 	if (!Number.isFinite(s.intervalSec) || s.intervalSec < MIN_INTERVAL) {
 		throw new Error(`Interval must be a number ≥ ${MIN_INTERVAL} (seconds).`);
 	}
@@ -202,6 +211,23 @@ export function validate(s: SpecInput): Compiled {
 	) {
 		throw new Error("Cooldown must be a number ≥ 0 (seconds).");
 	}
+
+	// Silence watch: no regex to compile, just a threshold. Validate it and
+	// return early so the pattern checks below don't apply.
+	if (s.type === "silence") {
+		if (!Number.isFinite(s.silenceSec) || (s.silenceSec ?? 0) < MIN_INTERVAL) {
+			throw new Error(
+				`Silence threshold must be a number ≥ ${MIN_INTERVAL} (seconds).`,
+			);
+		}
+		if ((s.silenceSec ?? 0) < s.intervalSec) {
+			throw new Error(
+				"Silence threshold should be ≥ the check interval, or it can't be detected.",
+			);
+		}
+		return;
+	}
+
 	if (
 		s.minMatches !== undefined &&
 		(!Number.isInteger(s.minMatches) || s.minMatches < 1)
@@ -301,57 +327,123 @@ async function check(m: Monitor): Promise<void> {
 		}
 		persist();
 	} catch (e) {
-		const detail = e instanceof Error ? e.message : String(e);
+		await handleCheckError(m, e, now);
+	} finally {
+		inFlight.delete(m.id);
+	}
+}
 
-		// The container may just have been recreated with a new id (stop/start,
-		// `compose up`). Try to rebind to the current container of the same name
-		// before counting this as a failure. Watch the rebound container from now
-		// forward so its startup logs don't flood in as a backlog.
-		if (isContainerGone(detail)) {
-			try {
-				const newId = await d.findIdByName(m.containerName);
-				if (newId && newId !== m.containerId) {
-					log.info("monitor_rebind", {
-						id: m.id,
-						container: m.containerName,
-						oldId: m.containerId,
-						newId,
-					});
-					m.containerId = newId;
-					m.lastCheck = now;
-					m.fails = 0;
-					persist();
-					return; // next tick polls the new container
+// Shared error handling for both pollers. A container that just got recreated
+// (stop/start, `compose up`) surfaces as "no such container"; rebind to the
+// current container of the same name instead of counting it as a failure.
+// Otherwise count the error and auto-disable after MAX_FAILS in a row.
+async function handleCheckError(
+	m: Monitor,
+	e: unknown,
+	now: number,
+): Promise<void> {
+	const detail = e instanceof Error ? e.message : String(e);
+	const label = m.type === "silence" ? `silence ≥${m.silenceSec}s` : `/${m.pattern}/`;
+
+	// Watch the rebound container from now forward so its startup logs don't
+	// flood in as a backlog.
+	if (isContainerGone(detail)) {
+		try {
+			const newId = await d.findIdByName(m.containerName);
+			if (newId && newId !== m.containerId) {
+				log.info("monitor_rebind", {
+					id: m.id,
+					container: m.containerName,
+					oldId: m.containerId,
+					newId,
+				});
+				m.containerId = newId;
+				m.lastCheck = now;
+				if (m.type === "silence") {
+					m.lastLogAt = now; // fresh container, reset the silence clock
+					m.alarming = false;
 				}
-			} catch {
-				// fall through to normal failure handling below
+				m.fails = 0;
+				persist();
+				return; // next tick polls the new container
+			}
+		} catch {
+			// fall through to normal failure handling below
+		}
+	}
+
+	m.fails += 1;
+	log.warn("monitor_check_failed", {
+		id: m.id,
+		container: m.containerName,
+		fails: m.fails,
+		error: detail,
+	});
+	if (m.fails >= MAX_FAILS) {
+		m.enabled = false;
+		stopTimer(m.id);
+		log.audit({
+			userId: "system",
+			action: "monitor_autodisable",
+			target: `${m.containerName} ${label}`,
+			result: "error",
+			detail,
+		});
+		await send(
+			m.chatId,
+			`⚠️ Monitor on *${m.containerName}* disabled after ${MAX_FAILS} ` +
+				`failed checks.\nLast error: \`${detail}\``,
+		).catch(() => {});
+	}
+	persist();
+}
+
+// Silence/heartbeat poller: alert when a running container stops producing new
+// logs for longer than silenceSec. A stopped container is legitimately quiet,
+// so we only alarm while it's running. Mirrors check()'s lifecycle (in-flight
+// guard, fail handling, persistence).
+async function checkSilence(m: Monitor): Promise<void> {
+	if (!m.enabled || inFlight.has(m.id)) return;
+	const now = Math.floor(Date.now() / 1000);
+
+	inFlight.add(m.id);
+	try {
+		const info = await d.inspect(m.containerId);
+		m.containerName = info.name; // refresh in case it changed
+		const text = await d.logsSince(m.containerId, m.lastCheck);
+		m.lastCheck = now;
+		m.fails = 0;
+
+		const hasOutput = text.split("\n").some((l) => l.length > 0);
+		if (hasOutput) {
+			m.lastLogAt = now;
+			// Recovered: only announce if we'd previously alerted on this silence.
+			if (m.alarming) {
+				m.alarming = false;
+				await send(
+					m.chatId,
+					`✅ Logs resumed — *${m.containerName}* is producing output again.`,
+				).catch(() => {});
+			}
+		} else if (info.state === "running") {
+			const silent = now - (m.lastLogAt ?? now);
+			if (silent >= (m.silenceSec ?? 0)) {
+				// Cooldown gate, same as the regex path: after an alert, stay quiet
+				// until the window elapses so a persistently-silent container can't
+				// re-ping every interval.
+				if (now - m.lastNotify >= m.cooldownSec) {
+					await notifySilence(m, silent);
+					m.lastNotify = now;
+					m.alarming = true;
+					// Optional remediation; gated by the same cooldown, so a stuck
+					// container restarts at most once per cooldown window.
+					if (m.restartOnMatch) await autoRestart(m);
+				}
 			}
 		}
-
-		m.fails += 1;
-		log.warn("monitor_check_failed", {
-			id: m.id,
-			container: m.containerName,
-			fails: m.fails,
-			error: detail,
-		});
-		if (m.fails >= MAX_FAILS) {
-			m.enabled = false;
-			stopTimer(m.id);
-			log.audit({
-				userId: "system",
-				action: "monitor_autodisable",
-				target: `${m.containerName} /${m.pattern}/`,
-				result: "error",
-				detail,
-			});
-			await send(
-				m.chatId,
-				`⚠️ Monitor on *${m.containerName}* disabled after ${MAX_FAILS} ` +
-					`failed checks.\nLast error: \`${detail}\``,
-			).catch(() => {});
-		}
 		persist();
+	} catch (e) {
+		await handleCheckError(m, e, now);
 	} finally {
 		inFlight.delete(m.id);
 	}
@@ -398,17 +490,53 @@ async function notify(
 	});
 }
 
+// Compact "2m 5s" / "45s" / "1h 3m" rendering for a duration in seconds.
+function fmtDuration(sec: number): string {
+	const s = Math.max(0, Math.floor(sec));
+	const h = Math.floor(s / 3600);
+	const m = Math.floor((s % 3600) / 60);
+	const r = s % 60;
+	const parts: string[] = [];
+	if (h) parts.push(`${h}h`);
+	if (m) parts.push(`${m}m`);
+	if (r || parts.length === 0) parts.push(`${r}s`);
+	return parts.join(" ");
+}
+
+// Silence alert: the container went quiet past its threshold. Same quick-action
+// buttons as a match alert (restart routes through the usual confirm step).
+async function notifySilence(m: Monitor, silentSec: number): Promise<void> {
+	const text =
+		`🔕 *Silence — ${m.containerName}*\n` +
+		`No new logs for ${fmtDuration(silentSec)} ` +
+		`(threshold ${fmtDuration(m.silenceSec ?? 0)}).`;
+	const buttons: Button[][] = [
+		[
+			{ text: "🔄 Restart", callback_data: `a:restart:${m.containerId}` },
+			{ text: "📄 Logs", callback_data: `a:logs50:${m.containerId}` },
+		],
+	];
+	await send(m.chatId, text, buttons).catch((e) => {
+		log.warn("monitor_notify_failed", {
+			id: m.id,
+			error: e instanceof Error ? e.message : String(e),
+		});
+	});
+}
+
 // Restart the watched container as an automatic remediation after an alert.
 // Called only from inside the cooldown+threshold gate in check(), so it can't
 // loop on a flapping line. Audited like any other lifecycle action, and the
 // outcome (success or failure) is reported to the same chat as the alert.
 async function autoRestart(m: Monitor): Promise<void> {
+	const label =
+		m.type === "silence" ? `silence ≥${m.silenceSec}s` : `/${m.pattern}/`;
 	try {
 		await d.restart(m.containerId);
 		log.audit({
 			userId: "system",
 			action: "monitor_autorestart",
-			target: `${m.containerName} /${m.pattern}/`,
+			target: `${m.containerName} ${label}`,
 			result: "ok",
 		});
 		await send(
@@ -420,7 +548,7 @@ async function autoRestart(m: Monitor): Promise<void> {
 		log.audit({
 			userId: "system",
 			action: "monitor_autorestart",
-			target: `${m.containerName} /${m.pattern}/`,
+			target: `${m.containerName} ${label}`,
 			result: "error",
 			detail,
 		});
@@ -434,8 +562,9 @@ async function autoRestart(m: Monitor): Promise<void> {
 function startTimer(m: Monitor): void {
 	stopTimer(m.id);
 	if (!m.enabled) return;
+	const poll = m.type === "silence" ? checkSilence : check;
 	// unref so a pending tick never blocks process shutdown.
-	const t = setInterval(() => void check(m), m.intervalSec * 1000);
+	const t = setInterval(() => void poll(m), m.intervalSec * 1000);
 	t.unref?.();
 	timers.set(m.id, t);
 }
@@ -475,21 +604,26 @@ export function addMonitor(input: AddInput): Monitor {
 	}
 	validate(input);
 	const id = crypto.randomUUID().slice(0, 8);
+	const now = Math.floor(Date.now() / 1000);
+	const silence = input.type === "silence";
 	const m: Monitor = {
 		id,
 		containerId: input.containerId,
 		containerName: input.containerName,
-		pattern: input.pattern,
-		ignore: input.ignore?.trim() || undefined,
-		multiline: input.multiline?.trim() || undefined,
+		type: silence ? "silence" : "regex",
+		pattern: silence ? "" : input.pattern, // unused for silence watches
+		ignore: silence ? undefined : input.ignore?.trim() || undefined,
+		multiline: silence ? undefined : input.multiline?.trim() || undefined,
 		restartOnMatch: input.restartOnMatch ?? false,
+		silenceSec: silence ? input.silenceSec : undefined,
+		lastLogAt: silence ? now : undefined, // assume output is current at creation
 		intervalSec: input.intervalSec,
 		cooldownSec: input.cooldownSec ?? DEFAULT_COOLDOWN,
 		minMatches: input.minMatches ?? 1,
 		chatId: input.chatId,
 		createdBy: input.createdBy,
 		enabled: true,
-		lastCheck: Math.floor(Date.now() / 1000), // watch from now forward only
+		lastCheck: now, // watch from now forward only
 		lastNotify: 0,
 		suppressed: 0,
 		fails: 0,
@@ -501,7 +635,9 @@ export function addMonitor(input: AddInput): Monitor {
 		userId: input.createdBy,
 		action: "monitor_add",
 		target:
-			`${input.containerName} /${input.pattern}/ @${input.intervalSec}s` +
+			(silence
+				? `${input.containerName} silence ≥${input.silenceSec}s @${input.intervalSec}s`
+				: `${input.containerName} /${input.pattern}/ @${input.intervalSec}s`) +
 			(m.restartOnMatch ? " +auto-restart" : ""),
 		result: "ok",
 	});
@@ -531,10 +667,15 @@ export function toggleMonitor(id: string, actorId = "unknown"): Monitor | undefi
 	if (!m) return undefined;
 	m.enabled = !m.enabled;
 	if (m.enabled) {
+		const now = Math.floor(Date.now() / 1000);
 		m.fails = 0;
-		m.lastCheck = Math.floor(Date.now() / 1000);
+		m.lastCheck = now;
 		m.lastNotify = 0;
 		m.suppressed = 0;
+		if (m.type === "silence") {
+			m.lastLogAt = now; // start the silence clock fresh from now
+			m.alarming = false;
+		}
 		startTimer(m);
 	} else {
 		stopTimer(id);
@@ -558,7 +699,11 @@ export function initMonitors(sender: SendFn): void {
 	load();
 	for (const m of monitors.values()) {
 		startTimer(m);
-		if (m.enabled) void check(m); // immediate catch-up; respects cooldown
+		if (m.enabled) {
+			// immediate catch-up; respects cooldown
+			if (m.type === "silence") void checkSilence(m);
+			else void check(m);
+		}
 	}
 	if (monitors.size > 0) {
 		log.info("monitors_started", {
