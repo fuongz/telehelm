@@ -147,7 +147,11 @@ interface Compiled {
 
 // Compile the match, optional ignore, and optional multiline firstline regexes.
 // Throws on a bad regex.
-function compile(pattern: string, ignore?: string, multiline?: string): Compiled {
+function compile(
+	pattern: string,
+	ignore?: string,
+	multiline?: string,
+): Compiled {
 	const re = new RegExp(pattern);
 	const ignoreRe = ignore?.trim() ? new RegExp(ignore) : undefined;
 	const firstlineRe = multiline?.trim() ? new RegExp(multiline) : undefined;
@@ -198,7 +202,7 @@ function assertSafeRegex(src: string | undefined, label: string): void {
 
 // Throws a user-facing Error on bad input; returns the compiled regexes for a
 // regex monitor, or void for a silence monitor (which has no pattern).
-export function validate(s: SpecInput): Compiled | void {
+export function validate(s: SpecInput): Compiled | undefined {
 	if (!Number.isFinite(s.intervalSec) || s.intervalSec < MIN_INTERVAL) {
 		throw new Error(`Interval must be a number ≥ ${MIN_INTERVAL} (seconds).`);
 	}
@@ -268,7 +272,11 @@ export async function preview(
 	s: SpecInput,
 	tail = PREVIEW_TAIL,
 ): Promise<{ sampled: number; matched: string[] }> {
-	const { re, ignoreRe, firstlineRe } = compile(s.pattern, s.ignore, s.multiline);
+	const { re, ignoreRe, firstlineRe } = compile(
+		s.pattern,
+		s.ignore,
+		s.multiline,
+	);
 	const { text } = await d.logs(containerId, tail);
 	const units = segment(text, firstlineRe);
 	const matched = units.filter(
@@ -343,7 +351,8 @@ async function handleCheckError(
 	now: number,
 ): Promise<void> {
 	const detail = e instanceof Error ? e.message : String(e);
-	const label = m.type === "silence" ? `silence ≥${m.silenceSec}s` : `/${m.pattern}/`;
+	const label =
+		m.type === "silence" ? `silence ≥${m.silenceSec}s` : `/${m.pattern}/`;
 
 	// Watch the rebound container from now forward so its startup logs don't
 	// flood in as a backlog.
@@ -644,7 +653,10 @@ export function addMonitor(input: AddInput): Monitor {
 	return m;
 }
 
-export function removeMonitor(id: string, actorId = "unknown"): Monitor | undefined {
+export function removeMonitor(
+	id: string,
+	actorId = "unknown",
+): Monitor | undefined {
 	const m = monitors.get(id);
 	if (!m) return undefined;
 	stopTimer(id);
@@ -662,7 +674,10 @@ export function removeMonitor(id: string, actorId = "unknown"): Monitor | undefi
 
 // Flip enabled on/off. Re-enabling resets the failure counter and the watch
 // window so it starts fresh from now (no backlog flood).
-export function toggleMonitor(id: string, actorId = "unknown"): Monitor | undefined {
+export function toggleMonitor(
+	id: string,
+	actorId = "unknown",
+): Monitor | undefined {
 	const m = monitors.get(id);
 	if (!m) return undefined;
 	m.enabled = !m.enabled;
