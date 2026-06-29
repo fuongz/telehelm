@@ -45,18 +45,48 @@ Layered on top:
 
 ## Setup
 
+First, get your two secrets:
+
 1. **Create the bot.** Message [@BotFather](https://t.me/BotFather) → `/newbot` → copy the token.
 2. **Find your user ID.** Message [@userinfobot](https://t.me/userinfobot); it replies with your numeric ID.
-3. **Configure.**
-   ```bash
-   cp .env.example .env
-   # edit .env: set BOT_TOKEN and ALLOWED_USER_IDS (comma-separated)
-   ```
-4. **Run** (on the homelab). Compose reads secrets from the `.env` file you just created:
-   ```bash
-   docker compose up -d --build
-   ```
-5. In Telegram, open your bot and send `/ps`.
+
+Then pick how to run it.
+
+### Quick start (no clone, Docker Hub image)
+
+The bot ships as a published multi-arch image — [`fuongz/telehelm`](https://hub.docker.com/r/fuongz/telehelm) (`linux/amd64` + `linux/arm64`) — so you don't need to clone the repo or build anything. Grab the compose file and the env template straight from GitHub, fill in the two secrets, and bring it up:
+
+```bash
+mkdir telehelm && cd telehelm
+
+# Compose stack + env template, pulled raw from the repo
+curl -fsSL -o docker-compose.yml https://raw.githubusercontent.com/fuongz/telehelm/main/docker-compose.yml
+curl -fsSL -o .env             https://raw.githubusercontent.com/fuongz/telehelm/main/.env.example
+
+# Edit .env: set BOT_TOKEN and ALLOWED_USER_IDS (comma-separated)
+nano .env
+
+# Pull the published image and start (compose reads secrets from .env)
+docker compose up -d
+```
+
+Update later with `docker compose pull && docker compose up -d`. In Telegram, open your bot and send `/ps`.
+
+> **Pin a version** instead of tracking `latest`: edit `docker-compose.yml` and set `image: fuongz/telehelm:1.0.0` (see [tags on Docker Hub](https://hub.docker.com/r/fuongz/telehelm/tags)).
+
+> **Portainer:** create a stack, paste the compose file (or point it at the raw URL above), and define `BOT_TOKEN` / `ALLOWED_USER_IDS` in the stack's *Environment variables* section instead of a `.env` file.
+
+### From a clone
+
+If you've cloned the repo (e.g. to develop or build your own image):
+
+```bash
+cp .env.example .env
+# edit .env: set BOT_TOKEN and ALLOWED_USER_IDS (comma-separated)
+docker compose up -d
+```
+
+To run your own locally built image rather than the published one, build it first with `make build` (tags `fuongz/telehelm:latest` locally, which compose then uses) — see [Building & publishing](#building--publishing-the-image).
 
 ### Local development (without Docker)
 
@@ -69,6 +99,20 @@ bun run typecheck  # tsc --noEmit
 ```
 
 Point the bot at your proxy with `DOCKER_PROXY_HOST` / `DOCKER_PROXY_PORT` (defaults: `socket-proxy:2375`). The default monitors path (`/data/monitors.json`) won't be writable outside Docker — set `MONITORS_FILE` to a local path (e.g. `./monitors.json`) if you want monitors to persist during local dev.
+
+### Building & publishing the image
+
+A `Makefile` wraps the Docker build/push flow. The image version is read from `package.json`, so that's the single source of truth.
+
+```bash
+make build         # local single-arch image (loaded into Docker, no push)
+make publish       # multi-arch (amd64 + arm64) build, push :<version> + :latest
+make bump-patch    # bump version in package.json (also bump-minor / bump-major)
+make version       # print the version that will be published
+make help          # list all targets
+```
+
+Typical release: `make bump-patch && make publish`. First publish requires `make login` (use a Docker Hub [Personal Access Token](https://hub.docker.com/settings/security) as the password). Override the target repo or platforms inline, e.g. `make publish IMAGE=youruser/yourname PLATFORMS=linux/amd64`.
 
 ## Usage
 

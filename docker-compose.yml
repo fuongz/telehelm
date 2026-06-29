@@ -66,11 +66,12 @@ services:
   # `required: false` keeps this working on Portainer, where you instead define
   # BOT_TOKEN / ALLOWED_USER_IDS in the stack's "Environment variables" section.
   bot:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: telehelm:latest
-    pull_policy: build      # always build locally; never pull from a registry
+    # Published multi-arch image (linux/amd64 + linux/arm64). Build & push new
+    # versions with the Makefile: `make bump-patch && make publish`.
+    # For local development against uncommitted changes, run `make build` (tags
+    # this same name locally) or temporarily add a `build:` block here.
+    image: fuongz/telehelm:latest
+    pull_policy: always     # pull the latest published image on `up`/`pull`
     container_name: telehelm-bot
     restart: unless-stopped
     init: true            # proper PID 1 / signal handling
