@@ -155,7 +155,8 @@ function fmtMonitor(m: mon.Monitor): string {
 	const dot = m.enabled ? "🟢" : "⚪";
 	const rs = m.restartOnMatch ? " · 🔄 auto-restart" : "";
 	if (m.type === "silence") {
-		return `${dot} 🔕 silence ≥${m.silenceSec}s · checks every ${m.intervalSec}s · cooldown ${m.cooldownSec}s${rs}`;
+		const after = m.afterPattern ? ` after \`/${m.afterPattern}/\`` : "";
+		return `${dot} 🔕 silence ≥${m.silenceSec}s${after} · checks every ${m.intervalSec}s · cooldown ${m.cooldownSec}s${rs}`;
 	}
 	const min = m.minMatches > 1 ? ` · ≥${m.minMatches}/check` : "";
 	const ml = m.multiline ? " · multiline" : "";
@@ -209,6 +210,13 @@ function parseSilenceSpec(text: string): mon.SpecInput {
 		if (iv) spec.intervalSec = parseInt(iv, 10);
 		const cd = /^cooldown:\s*(\d+)\s*$/i.exec(ln)?.[1];
 		if (cd) spec.cooldownSec = parseInt(cd, 10);
+		// `after: <regex>` turns this into a pattern-armed watch: only start the
+		// silence clock once a line matches, then alert if nothing else follows.
+		const af = /^after:\s*(.+)$/i.exec(ln)?.[1];
+		if (af) spec.afterPattern = af.trim();
+		// `ignore: <regex>` filters noise lines so a periodic ping doesn't disarm.
+		const ig = /^ignore:\s*(.+)$/i.exec(ln)?.[1];
+		if (ig) spec.ignore = ig.trim();
 		if (/^restart:\s*(on|true|yes|1)\s*$/i.test(ln)) spec.restartOnMatch = true;
 	}
 	return spec;
@@ -286,6 +294,9 @@ async function monitorSilenceAddPrompt(ctx: Context, id: string): Promise<void> 
 		"Optional extra lines:\n" +
 		"`interval: 60` — how often to check (default min(60, threshold))\n" +
 		"`cooldown: 600` — min seconds between alerts\n" +
+		"`after: socket closed` — only arm after this regex appears, then alert " +
+		"if nothing else is logged for the threshold\n" +
+		"`ignore: healthcheck` — skip noisy lines (won't count as activity)\n" +
 		"`restart: on` — restart the container when it goes silent (default off)\n\n" +
 		"Only fires while the container is *running* (a stopped one is quiet on " +
 		"purpose).\nSend /cancel to abort.";
@@ -338,7 +349,10 @@ async function handleMonitorReply(
 		const info = await d.inspect(pending.containerId);
 		const head =
 			`*Silence watch — ${info.name}*\n` +
-			`Alerts if no new logs for ≥${spec.silenceSec}s\n` +
+			(spec.afterPattern
+				? `Arms after \`${spec.afterPattern}\`, then alerts if no new logs for ≥${spec.silenceSec}s\n`
+				: `Alerts if no new logs for ≥${spec.silenceSec}s\n`) +
+			(spec.afterPattern && spec.ignore ? `Ignore: \`${spec.ignore}\`\n` : "") +
 			`Checks every ${spec.intervalSec}s` +
 			(spec.cooldownSec !== undefined ? `, cooldown ${spec.cooldownSec}s` : "") +
 			(spec.restartOnMatch

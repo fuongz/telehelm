@@ -25,7 +25,13 @@ export interface Monitor {
 	multiline?: string; // optional "firstline" regex — groups multi-line blocks (stack traces)
 	restartOnMatch?: boolean; // when true, restart the container after an alert fires (off by default)
 	silenceSec?: number; // silence watch: alert if no new logs for this many seconds
-	lastLogAt?: number; // silence watch: unix seconds when output was last seen
+	// silence watch: optional "arming" regex. When set, the watch stays dormant
+	// until a line matches this pattern, then alerts only if nothing else is
+	// logged for silenceSec — i.e. "after `socket closed`, then silence". Any
+	// other line logged after the trigger disarms it.
+	afterPattern?: string;
+	armed?: boolean; // silence watch (after-pattern): true once the trigger fired and we're waiting out the silence
+	lastLogAt?: number; // silence watch: unix seconds when output was last seen (or, when armed, when the trigger fired)
 	alarming?: boolean; // silence watch: true while a silence alert is active, so recovery fires once
 	intervalSec: number;
 	cooldownSec: number; // min seconds between notifications, to prevent storms
@@ -137,6 +143,7 @@ export interface SpecInput {
 	minMatches?: number;
 	restartOnMatch?: boolean;
 	silenceSec?: number; // required when type === "silence"
+	afterPattern?: string; // optional (silence only): arm the silence clock only after this regex matches
 }
 
 interface Compiled {
@@ -228,6 +235,28 @@ export function validate(s: SpecInput): Compiled | undefined {
 			throw new Error(
 				"Silence threshold should be ≥ the check interval, or it can't be detected.",
 			);
+		}
+		// Optional "after" trigger: a silence watch that only arms once this regex
+		// matches a log line. Validate it (and the noise filter) like any pattern.
+		if (s.afterPattern?.trim()) {
+			try {
+				new RegExp(s.afterPattern);
+			} catch (e) {
+				throw new Error(
+					`Invalid "after" regex: ${e instanceof Error ? e.message : String(e)}`,
+				);
+			}
+			assertSafeRegex(s.afterPattern, "After-pattern");
+			assertSafeRegex(s.ignore, "Ignore regex");
+			if (s.ignore?.trim()) {
+				try {
+					new RegExp(s.ignore);
+				} catch (e) {
+					throw new Error(
+						`Invalid ignore regex: ${e instanceof Error ? e.message : String(e)}`,
+					);
+				}
+			}
 		}
 		return;
 	}
@@ -371,6 +400,7 @@ async function handleCheckError(
 				if (m.type === "silence") {
 					m.lastLogAt = now; // fresh container, reset the silence clock
 					m.alarming = false;
+					m.armed = false; // re-arm only when the trigger fires again
 				}
 				m.fails = 0;
 				persist();
@@ -423,6 +453,15 @@ async function checkSilence(m: Monitor): Promise<void> {
 		m.lastCheck = now;
 		m.fails = 0;
 
+		// Pattern-armed silence: stay dormant until a line matches afterPattern,
+		// then alert only if nothing else is logged for silenceSec. Distinct enough
+		// from the plain heartbeat that it gets its own branch.
+		if (m.afterPattern) {
+			await checkArmedSilence(m, text, info, now);
+			persist();
+			return;
+		}
+
 		const hasOutput = text.split("\n").some((l) => l.length > 0);
 		if (hasOutput) {
 			m.lastLogAt = now;
@@ -455,6 +494,72 @@ async function checkSilence(m: Monitor): Promise<void> {
 		await handleCheckError(m, e, now);
 	} finally {
 		inFlight.delete(m.id);
+	}
+}
+
+// Pattern-armed silence step. Called from checkSilence() when m.afterPattern is
+// set. The watch arms when the most recent (non-ignored) log line matches the
+// trigger, and alerts only if no further output arrives for silenceSec. Any
+// other line logged after the trigger disarms it — that's the "and nothing else"
+// part. lastLogAt doubles as the moment the trigger fired (the silence origin).
+async function checkArmedSilence(
+	m: Monitor,
+	text: string,
+	info: Awaited<ReturnType<typeof d.inspect>>,
+	now: number,
+): Promise<void> {
+	let re: RegExp;
+	let ignoreRe: RegExp | undefined;
+	try {
+		({ re, ignoreRe } = compile(m.afterPattern ?? "", m.ignore));
+	} catch {
+		return; // validated at creation; shouldn't happen
+	}
+
+	// Non-ignored output since the last check, in order. Ignored (noise) lines
+	// don't count as activity, so a periodic health ping won't disarm the watch.
+	const lines = text
+		.split("\n")
+		.filter((l) => l.length > 0)
+		.filter((l) => !(ignoreRe && safeTest(ignoreRe, l)));
+
+	if (lines.length > 0) {
+		const lastLine = lines[lines.length - 1] ?? "";
+		if (safeTest(re, lastLine)) {
+			// The trigger is the most recent thing in the logs → (re)arm and start
+			// the silence clock from now. Clear any prior alarm: this is a new cycle.
+			m.armed = true;
+			m.lastLogAt = now;
+			m.alarming = false;
+		} else {
+			// Something else was logged after the trigger → the container is alive,
+			// so disarm. Announce recovery only if we'd alerted on this silence.
+			if (m.alarming) {
+				m.alarming = false;
+				await send(
+					m.chatId,
+					`✅ Logs resumed — *${m.containerName}* is active again ` +
+						`after \`${m.afterPattern}\`.`,
+				).catch(() => {});
+			}
+			m.armed = false;
+		}
+		return;
+	}
+
+	// No new output. If we're armed and the container is still running, the
+	// silence after the trigger is what we're watching for.
+	if (m.armed && info.state === "running") {
+		const silent = now - (m.lastLogAt ?? now);
+		if (silent >= (m.silenceSec ?? 0)) {
+			// Cooldown gate, same as the other pollers.
+			if (now - m.lastNotify >= m.cooldownSec) {
+				await notifySilence(m, silent);
+				m.lastNotify = now;
+				m.alarming = true;
+				if (m.restartOnMatch) await autoRestart(m);
+			}
+		}
 	}
 }
 
@@ -515,10 +620,13 @@ function fmtDuration(sec: number): string {
 // Silence alert: the container went quiet past its threshold. Same quick-action
 // buttons as a match alert (restart routes through the usual confirm step).
 async function notifySilence(m: Monitor, silentSec: number): Promise<void> {
-	const text =
-		`🔕 *Silence — ${m.containerName}*\n` +
-		`No new logs for ${fmtDuration(silentSec)} ` +
-		`(threshold ${fmtDuration(m.silenceSec ?? 0)}).`;
+	const text = m.afterPattern
+		? `🔕 *Silence after match — ${m.containerName}*\n` +
+			`No new logs for ${fmtDuration(silentSec)} after \`${m.afterPattern}\` ` +
+			`(threshold ${fmtDuration(m.silenceSec ?? 0)}).`
+		: `🔕 *Silence — ${m.containerName}*\n` +
+			`No new logs for ${fmtDuration(silentSec)} ` +
+			`(threshold ${fmtDuration(m.silenceSec ?? 0)}).`;
 	const buttons: Button[][] = [
 		[
 			{ text: "🔄 Restart", callback_data: `a:restart:${m.containerId}` },
@@ -621,10 +729,17 @@ export function addMonitor(input: AddInput): Monitor {
 		containerName: input.containerName,
 		type: silence ? "silence" : "regex",
 		pattern: silence ? "" : input.pattern, // unused for silence watches
-		ignore: silence ? undefined : input.ignore?.trim() || undefined,
+		// `ignore` is a noise filter; it applies to regex watches and to the
+		// arming pattern of an "after" silence watch, but not a plain heartbeat.
+		ignore:
+			silence && !input.afterPattern
+				? undefined
+				: input.ignore?.trim() || undefined,
 		multiline: silence ? undefined : input.multiline?.trim() || undefined,
 		restartOnMatch: input.restartOnMatch ?? false,
 		silenceSec: silence ? input.silenceSec : undefined,
+		afterPattern: silence ? input.afterPattern?.trim() || undefined : undefined,
+		armed: false, // an "after" watch starts dormant until its trigger fires
 		lastLogAt: silence ? now : undefined, // assume output is current at creation
 		intervalSec: input.intervalSec,
 		cooldownSec: input.cooldownSec ?? DEFAULT_COOLDOWN,
@@ -645,7 +760,9 @@ export function addMonitor(input: AddInput): Monitor {
 		action: "monitor_add",
 		target:
 			(silence
-				? `${input.containerName} silence ≥${input.silenceSec}s @${input.intervalSec}s`
+				? `${input.containerName} silence ≥${input.silenceSec}s` +
+					(input.afterPattern ? ` after /${input.afterPattern}/` : "") +
+					` @${input.intervalSec}s`
 				: `${input.containerName} /${input.pattern}/ @${input.intervalSec}s`) +
 			(m.restartOnMatch ? " +auto-restart" : ""),
 		result: "ok",
@@ -690,6 +807,7 @@ export function toggleMonitor(
 		if (m.type === "silence") {
 			m.lastLogAt = now; // start the silence clock fresh from now
 			m.alarming = false;
+			m.armed = false; // re-arm only when the trigger fires again
 		}
 		startTimer(m);
 	} else {
