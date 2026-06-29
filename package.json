@@ -1,6 +1,6 @@
 {
   "name": "telehelm",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Control a homelab Docker host from Telegram, via a least-privilege socket proxy.",
   "module": "src/index.ts",
   "type": "module",
